@@ -1,0 +1,11 @@
+# Root gitignore
+.env
+.vscode/
+Backend/venv/
+Backend/__pycache__/
+Backend/recordings/
+Frontend/node_modules/
+Frontend/dist/
+Frontend/build/
+*.log
+.DS_Store

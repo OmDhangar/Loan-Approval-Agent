@@ -1,0 +1,115 @@
+version: "3.9"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Poonawalla Fincorp – Loan Wizard 2026
+# Docker Compose – Full local development stack
+# ══════════════════════════════════════════════════════════════════════════════
+
+services:
+
+  # ── FastAPI Backend ──────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_ENV=development
+      - REDIS_URL=redis://redis:6379/0
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/loanwizard
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - VIDEOSDK_API_KEY=${VIDEOSDK_API_KEY}
+      - VIDEOSDK_SECRET_KEY=${VIDEOSDK_SECRET_KEY}
+    depends_on:
+      - redis
+      - rabbitmq
+      - postgres
+      - ollama
+    volumes:
+      - ./backend:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  # ── React Frontend ────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_API_BASE_URL=http://localhost:8000
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    command: npm run dev -- --host
+
+  # ── Redis (Shared State) ──────────────────────────────────────────────────────
+  redis:
+    image: redis:7.4-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+
+  # ── RabbitMQ (Agent Task Queue) ───────────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"   # Management UI
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+  # ── PostgreSQL (Audit Log) ────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB:       loanwizard
+      POSTGRES_USER:     postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  # ── Ollama (Local LLM) ────────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ── Ollama model pull (one-time init) ─────────────────────────────────────────
+  ollama-init:
+    image: ollama/ollama:latest
+    depends_on:
+      - ollama
+    entrypoint: >
+      sh -c "
+        sleep 10 &&
+        ollama pull llama3.1:8b &&
+        echo 'Models ready'
+      "
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+
+volumes:
+  redis_data:
+  rabbitmq_data:
+  postgres_data:
+  ollama_models:

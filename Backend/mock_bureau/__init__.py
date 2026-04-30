@@ -1,0 +1,1 @@
+# Mock Credit Bureau API – Simulates CIBIL / Experian responses
