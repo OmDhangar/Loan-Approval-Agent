@@ -13,37 +13,126 @@ import { useParams } from "react-router-dom";
 import { useVideoSDKSession } from "../hooks/videoSDKSession";
 import VideoCallScreen from "../components/videoCallScreen";
 
-const BRAND = {
-  primary:   "#0047AB",
-  accent:    "#00C9A7",
-  surface:   "#0A0F1E",
-  text:      "#F1F5F9",
-  textMuted: "#94A3B8",
-};
-
 export default function JoinPage() {
   const { sessionToken } = useParams();
   const { loading, error, callId, roomId, videoSdkToken } = useVideoSDKSession(sessionToken);
 
   if (loading) {
     return (
-      <div style={styles.center}>
-        <div style={styles.spinner} />
-        <p style={styles.loadingText}>Preparing your secure call…</p>
-        <p style={styles.subText}>This takes just a moment</p>
+      <div className="center-screen animate-fade-in">
+        <div className="loader-container">
+          <div className="loader"></div>
+          <div className="loader-glow"></div>
+        </div>
+        <h2 className="loading-title">Securing Connection</h2>
+        <p className="loading-subtitle">Initializing our AI Agent for your session...</p>
+        
+        <style jsx>{`
+          .center-screen {
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background: var(--bg-primary);
+            text-align: center;
+            padding: 40px;
+          }
+          .loader-container {
+            position: relative;
+            margin-bottom: 32px;
+          }
+          .loader {
+            width: 64px;
+            height: 64px;
+            border: 3px solid var(--surface);
+            border-top: 3px solid var(--accent-primary);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+          }
+          .loader-glow {
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: var(--accent-glow);
+            filter: blur(20px);
+            opacity: 0.3;
+            border-radius: 50%;
+          }
+          .loading-title {
+            font-size: 24px;
+            margin-bottom: 8px;
+            background: linear-gradient(135deg, #fff 0%, #94a3b8 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+          }
+          .loading-subtitle {
+            color: var(--text-tertiary);
+            font-size: 16px;
+          }
+          @keyframes spin {
+            to { transform: rotate(360deg); }
+          }
+        `}</style>
       </div>
     );
   }
 
   if (error) {
     return (
-      <div style={styles.center}>
-        <div style={styles.errorIcon}>⚠️</div>
-        <h2 style={styles.errorTitle}>Unable to join</h2>
-        <p style={styles.errorText}>{error}</p>
-        <p style={styles.errorHint}>
-          Your link may have expired. Please request a new one from Poonawalla Fincorp.
-        </p>
+      <div className="center-screen animate-fade-in">
+        <div className="glass-card error-card">
+          <div className="error-icon">⚠️</div>
+          <h2>Session Unavailable</h2>
+          <p className="error-msg">{error}</p>
+          <div className="divider"></div>
+          <p className="error-hint">
+            The link may have expired or is invalid. Please contact support if you believe this is an error.
+          </p>
+          <button className="btn-outline full-width" onClick={() => window.location.href='/'}>
+            Back to Home
+          </button>
+        </div>
+
+        <style jsx>{`
+          .center-screen {
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: var(--bg-primary);
+            padding: 24px;
+          }
+          .error-card {
+            max-width: 440px;
+            padding: 40px;
+            text-align: center;
+          }
+          .error-icon {
+            font-size: 48px;
+            margin-bottom: 24px;
+          }
+          h2 { margin-bottom: 16px; }
+          .error-msg {
+            color: var(--error);
+            background: rgba(239, 68, 68, 0.1);
+            padding: 12px;
+            border-radius: 8px;
+            font-size: 14px;
+            margin-bottom: 24px;
+          }
+          .divider {
+            height: 1px;
+            background: var(--border);
+            margin: 24px 0;
+          }
+          .error-hint {
+            color: var(--text-tertiary);
+            font-size: 14px;
+            margin-bottom: 32px;
+            line-height: 1.6;
+          }
+          .full-width { width: 100%; }
+        `}</style>
       </div>
     );
   }
@@ -56,34 +145,3 @@ export default function JoinPage() {
     />
   );
 }
-
-const styles = {
-  center: {
-    minHeight: "100vh",
-    display: "flex", flexDirection: "column",
-    alignItems: "center", justifyContent: "center",
-    background: BRAND.surface, color: BRAND.text,
-    fontFamily: "'DM Sans', sans-serif",
-    textAlign: "center", padding: 24,
-  },
-  spinner: {
-    width: 48, height: 48,
-    border: `3px solid rgba(255,255,255,0.1)`,
-    borderTop: `3px solid ${BRAND.accent}`,
-    borderRadius: "50%",
-    animation: "spin 0.8s linear infinite",
-    marginBottom: 24,
-  },
-  loadingText: { fontSize: 18, fontWeight: 600, margin: "0 0 8px" },
-  subText: { fontSize: 14, color: BRAND.textMuted, margin: 0 },
-  errorIcon: { fontSize: 48, marginBottom: 16 },
-  errorTitle: { fontSize: 22, fontWeight: 700, margin: "0 0 12px" },
-  errorText: {
-    fontSize: 15, color: BRAND.textMuted,
-    background: "rgba(255,71,87,0.12)",
-    border: "1px solid rgba(255,71,87,0.3)",
-    borderRadius: 10, padding: "10px 20px",
-    maxWidth: 360,
-  },
-  errorHint: { fontSize: 13, color: BRAND.textMuted, marginTop: 20, maxWidth: 320, lineHeight: 1.6 },
-};

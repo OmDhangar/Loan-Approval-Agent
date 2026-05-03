@@ -14,30 +14,31 @@ import {
 
 // ── Design tokens ─────────────────────────────────────────────────────────────
 const BRAND = {
-  primary:    "#0047AB",   // Poonawalla blue
-  accent:     "#00C9A7",   // Teal
-  danger:     "#FF4757",
-  surface:    "#0A0F1E",
-  surfaceAlt: "#111827",
-  border:     "rgba(255,255,255,0.08)",
-  text:       "#F1F5F9",
-  textMuted:  "#94A3B8",
+  primary:    "#3b82f6",   // Electric Blue
+  accent:     "#60a5fa",   // Cyan
+  danger:     "#ef4444",
+  surface:    "rgba(255, 255, 255, 0.03)",
+  surfaceAlt: "rgba(255, 255, 255, 0.05)",
+  border:     "rgba(255, 255, 255, 0.1)",
+  text:       "#f8fafc",
+  textMuted:  "#94a3b8",
 };
 
 const STAGE_META = {
-  INIT:                 { label: "Connecting…",          icon: "⏳", pct: 0  },
-  GREETING_CONSENT:     { label: "Consent",               icon: "🤝", pct: 8  },
-  OVD_DOCUMENT_CAPTURE: { label: "Document Capture",      icon: "📄", pct: 18 },
-  LIVENESS_CHALLENGE:   { label: "Liveness Check",        icon: "👁️", pct: 28 },
-  AADHAAR_VERIFICATION: { label: "Aadhaar Verification",  icon: "🔐", pct: 38 },
-  IDENTITY_KYC:         { label: "Identity Verification", icon: "🪪", pct: 48 },
-  EMPLOYMENT_INCOME:    { label: "Income Details",        icon: "💼", pct: 60 },
-  LOAN_PURPOSE:         { label: "Loan Purpose",          icon: "🎯", pct: 72 },
-  RISK_ASSESSMENT:      { label: "Assessment",            icon: "📊", pct: 84 },
-  OFFER_ACCEPTANCE:     { label: "Your Offer",            icon: "🎁", pct: 95 },
-  COMPLETED:            { label: "Complete!",             icon: "✅", pct: 100 },
-  ESCALATED:            { label: "Human Agent",           icon: "👤", pct: 84 },
+  INIT:                 { label: "Initializing…",        icon: "⚡", pct: 0  },
+  GREETING_CONSENT:     { label: "Consent & Greeting",    icon: "🤝", pct: 8  },
+  OVD_DOCUMENT_CAPTURE: { label: "Document Verification", icon: "📄", pct: 18 },
+  LIVENESS_CHALLENGE:   { label: "Biometric Liveness",    icon: "👁️", pct: 28 },
+  AADHAAR_VERIFICATION: { label: "Digital Aadhaar",       icon: "🔐", pct: 38 },
+  IDENTITY_KYC:         { label: "Identity Match",        icon: "🪪", pct: 48 },
+  EMPLOYMENT_INCOME:    { label: "Financial Data",        icon: "💼", pct: 60 },
+  LOAN_PURPOSE:         { label: "Loan Objective",        icon: "🎯", pct: 72 },
+  RISK_ASSESSMENT:      { label: "AI Underwriting",       icon: "📊", pct: 84 },
+  OFFER_ACCEPTANCE:     { label: "Loan Offer",            icon: "🎁", pct: 95 },
+  COMPLETED:            { label: "Approved!",             icon: "✅", pct: 100 },
+  ESCALATED:            { label: "Human Officer",         icon: "👤", pct: 84 },
 };
+
 
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -78,7 +79,10 @@ function CallUI({ callId }) {
     meetingId,
   } = useMeeting({
     onMeetingJoined:  () => console.log("Meeting joined"),
-    onMeetingLeft:    () => console.log("Meeting left"),
+    onMeetingLeft:    () => {
+      console.log("Meeting left");
+      setJoined(false);
+    },
     onError:          (err) => console.error("Meeting error:", err),
   });
 
@@ -109,6 +113,9 @@ function CallUI({ callId }) {
   const localVideoRef                    = useRef(null);
   // Speech recognition refs (replaces paid VideoSDK transcription)
   const recognitionRef                   = useRef(null);
+  const recordingStreamRef               = useRef(null);
+  const localParticipantId = localParticipant?.id;
+  const { webcamStream, micStream } = useParticipant(localParticipantId);
 
   // ── SSE – real-time backend events ────────────────────────────────────────
   useEffect(() => {
@@ -120,15 +127,21 @@ function CallUI({ callId }) {
       switch (evt.event) {
         case "AI_AGENT_SPEECH":
           setAgentSpeech(evt.text);
-          // Play audio if available (URL served from backend)
-          if (evt.audio_url && audioPlayerRef.current) {
-            audioPlayerRef.current.src = evt.audio_url;
-            audioPlayerRef.current.play().catch(err => {
-              console.warn("Failed to auto-play TTS audio:", err);
-            });
-          }
           // Clear agent speech after 10 seconds
           setTimeout(() => setAgentSpeech(""), 10000);
+          break;
+        case "TTS_AUDIO_READY":
+          // Play audio when synthesis is complete
+          if (evt.audio_url && audioPlayerRef.current) {
+            console.log("Playing agent audio:", evt.audio_url);
+            audioPlayerRef.current.src = evt.audio_url;
+            audioPlayerRef.current.play().catch(err => {
+              console.error("Agent audio playback failed:", err);
+              setError("Audio playback blocked. Please click anywhere on the page.");
+            });
+          } else {
+            console.warn("TTS_AUDIO_READY received but audioPlayerRef or audio_url is missing");
+          }
           break;
         case "STT_UTTERANCE":
           setCaption(evt.transcript);
@@ -383,21 +396,27 @@ function CallUI({ callId }) {
       };
 
       recorder.stop();
+
+      // Stop the media tracks to turn off the camera/mic
+      if (recordingStreamRef.current) {
+        recordingStreamRef.current.getTracks().forEach(track => track.stop());
+        recordingStreamRef.current = null;
+      }
     });
   }, [callId]);
 
-  // Start recording after joining — capture local media stream
+  // Start recording after joining — reuse VideoSDK tracks to avoid 2nd camera stream
   useEffect(() => {
-    if (!joined) return;
+    if (!joined || !webcamStream || !micStream) return;
 
-    // Get local stream for recording
-    navigator.mediaDevices.getUserMedia({ video: true, audio: true })
-      .then((stream) => {
-        startClientRecording(stream);
-      })
-      .catch((err) => {
-        console.warn("Could not access media for recording:", err);
-      });
+    try {
+      const stream = new MediaStream([webcamStream.track, micStream.track]);
+      recordingStreamRef.current = stream;
+      startClientRecording(stream);
+      console.log("Recording started using VideoSDK tracks");
+    } catch (err) {
+      console.warn("Failed to start recording from VideoSDK tracks:", err);
+    }
 
     return () => {
       // Cleanup on unmount
@@ -405,7 +424,7 @@ function CallUI({ callId }) {
         mediaRecorderRef.current.stop();
       }
     };
-  }, [joined, startClientRecording]);
+  }, [joined, webcamStream, micStream, startClientRecording]);
 
   // ── Canvas snapshot for vision agent ───────────────────────────────────────
   // Captures video frames and sends to backend for face/liveness analysis
@@ -459,10 +478,22 @@ function CallUI({ callId }) {
   }, [joined, stage, callId]);
 
   const handleLeave = useCallback(async () => {
-    // Upload recording before leaving
-    await stopAndUploadRecording();
-    await notifySessionEnd();
-    leave();
+    console.log("End call initiated...");
+    
+    // 1. Stop recording (this starts the background upload, do NOT await)
+    stopAndUploadRecording();
+    
+    // 2. Notify backend that session is ending (non-blocking, uses keepalive)
+    notifySessionEnd();
+    
+    // 3. Leave the VideoSDK meeting immediately
+    try {
+      leave();
+    } catch (e) {
+      console.warn("Error during VideoSDK leave:", e);
+    }
+    
+    console.log("Call ended locally.");
   }, [leave, notifySessionEnd, stopAndUploadRecording]);
 
   const participantIds = [...participants.keys()].filter(
@@ -473,6 +504,11 @@ function CallUI({ callId }) {
   // ── Layout ────────────────────────────────────────────────────────────────
   return (
     <div style={styles.root}>
+      <audio 
+        ref={audioPlayerRef} 
+        style={{ position: 'absolute', opacity: 0, pointerEvents: 'none' }} 
+        crossOrigin="anonymous"
+      />
       {/* Background grain texture */}
       <div style={styles.grain} />
 
@@ -540,9 +576,6 @@ function CallUI({ callId }) {
                 </p>
               </div>
             )}
-
-            {/* Hidden audio player for TTS */}
-            <audio ref={audioPlayerRef} style={{ display: "none" }} />
 
             {/* Document Upload Overlay */}
             {stage === "OVD_DOCUMENT_CAPTURE" && (
@@ -943,7 +976,6 @@ function ControlBar({ micOn, camOn, onToggleMic, onToggleCam, onLeave, audioFirs
         label="End Call"
         danger
         onClick={onLeave}
-        disabled={stage === "OFFER_ACCEPTANCE"}
       />
     </footer>
   );
@@ -975,283 +1007,291 @@ function CtrlBtn({ icon, label, onClick, danger, active, disabled }) {
 const styles = {
   root: {
     display: "flex", flexDirection: "column",
-    minHeight: "100vh", background: BRAND.surface,
-    color: BRAND.text, fontFamily: "'DM Sans', 'Segoe UI', sans-serif",
+    minHeight: "100vh", background: "var(--bg-primary)",
+    color: "var(--text-primary)", fontFamily: "var(--font-sans)",
     position: "relative", overflow: "hidden",
   },
   grain: {
     position: "fixed", inset: 0, zIndex: 0, pointerEvents: "none",
-    backgroundImage: `url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.035'/%3E%3C/svg%3E")`,
+    backgroundImage: `url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.02'/%3E%3C/svg%3E")`,
     backgroundSize: "128px",
   },
   header: {
     display: "flex", alignItems: "center", justifyContent: "space-between",
-    padding: "12px 24px", borderBottom: `1px solid ${BRAND.border}`,
-    background: "rgba(10,15,30,0.9)", backdropFilter: "blur(12px)",
+    padding: "16px 32px", borderBottom: "1px solid var(--border)",
+    background: "rgba(5,5,5,0.8)", backdropFilter: "blur(12px)",
     position: "relative", zIndex: 10,
   },
-  brandMark: { display: "flex", alignItems: "center", gap: 10 },
+  brandMark: { display: "flex", alignItems: "center", gap: 12 },
   brandDot: {
-    width: 10, height: 10, borderRadius: "50%",
-    background: BRAND.accent, boxShadow: `0 0 12px ${BRAND.accent}`,
+    width: 8, height: 8, borderRadius: "50%",
+    background: "var(--accent-primary)", boxShadow: "0 0 15px var(--accent-glow)",
   },
-  brandName: { fontWeight: 700, fontSize: 16, letterSpacing: "-0.02em" },
-  headerCenter: { display: "flex", alignItems: "center", gap: 12 },
+  brandName: { fontWeight: 700, fontSize: 18, fontFamily: "var(--font-heading)", letterSpacing: "-0.02em" },
+  headerCenter: { display: "flex", alignItems: "center", gap: 24 },
   headerRight: {},
   roomTag: {
-    fontSize: 11, color: BRAND.textMuted,
-    fontFamily: "monospace", letterSpacing: "0.08em",
+    fontSize: 10, color: "var(--text-tertiary)",
+    fontFamily: "monospace", letterSpacing: "0.1em",
+    textTransform: "uppercase",
   },
   progressRail: {
-    height: 6, background: BRAND.surfaceAlt,
+    height: 4, background: "var(--bg-tertiary)",
     position: "relative", overflow: "hidden",
   },
   progressFill: {
     height: "100%",
-    background: `linear-gradient(90deg, ${BRAND.primary}, ${BRAND.accent})`,
-    transition: "width 0.8s cubic-bezier(0.4,0,0.2,1)",
-    boxShadow: `0 0 20px ${BRAND.accent}60`,
+    background: "linear-gradient(90deg, var(--accent-primary), var(--accent-secondary))",
+    transition: "width 1s cubic-bezier(0.4,0,0.2,1)",
+    boxShadow: "0 0 20px var(--accent-glow)",
   },
   progressLabel: {
-    position: "absolute", right: 12, top: "50%",
-    transform: "translateY(-50%)",
-    fontSize: 11, color: BRAND.textMuted,
-    display: "flex", alignItems: "center", gap: 4,
+    display: "none", // Cleaner look
   },
-  progressPct: { marginLeft: 8, color: BRAND.accent, fontWeight: 600 },
   main: {
     flex: 1, display: "flex", flexDirection: "column", alignItems: "center",
-    padding: "24px", gap: 20, position: "relative", zIndex: 2,
+    padding: "40px 24px", gap: 32, position: "relative", zIndex: 2,
   },
   videoGrid: {
-    display: "flex", gap: 16, flexWrap: "wrap", justifyContent: "center",
-    width: "100%", maxWidth: 900,
+    display: "flex", gap: 24, flexWrap: "wrap", justifyContent: "center",
+    width: "100%", maxWidth: 1000,
   },
   videoCard: {
-    position: "relative", borderRadius: 16,
-    overflow: "hidden", background: BRAND.surfaceAlt,
-    border: `1px solid ${BRAND.border}`,
-    width: 360, height: 270,
-    boxShadow: "0 8px 40px rgba(0,0,0,0.5)",
+    position: "relative", borderRadius: 24,
+    overflow: "hidden", background: "var(--surface)",
+    border: "1px solid var(--border)",
+    width: 440, height: 330,
+    boxShadow: "0 20px 50px rgba(0,0,0,0.5)",
+    transition: "all 0.3s ease",
   },
   officerCard: {
-    border: `1px solid ${BRAND.accent}60`,
-    boxShadow: `0 0 20px ${BRAND.accent}20`,
+    border: "2px solid var(--accent-primary)",
+    boxShadow: "0 0 30px var(--accent-glow)",
   },
   video: { width: "100%", height: "100%", objectFit: "cover" },
   videoOff: {
     width: "100%", height: "100%",
     display: "flex", flexDirection: "column",
     alignItems: "center", justifyContent: "center",
+    background: "linear-gradient(135deg, #0a0a0a 0%, #111 100%)",
   },
   videoLabel: {
-    position: "absolute", bottom: 10, left: 12,
+    position: "absolute", bottom: 16, left: 16,
     fontSize: 12, fontWeight: 600,
-    background: "rgba(0,0,0,0.65)",
-    padding: "6px 12px", borderRadius: 20,
-    backdropFilter: "blur(6px)",
-    display: "flex", alignItems: "center", gap: 6,
+    background: "rgba(0,0,0,0.6)",
+    padding: "8px 16px", borderRadius: 100,
+    backdropFilter: "blur(8px)",
+    border: "1px solid rgba(255,255,255,0.1)",
+    display: "flex", alignItems: "center", gap: 8,
   },
   stageCard: {
-    display: "flex", alignItems: "center", gap: 14,
-    background: "rgba(17,24,39,0.85)", backdropFilter: "blur(12px)",
-    border: `1px solid ${BRAND.border}`,
-    borderRadius: 14, padding: "14px 20px",
-    maxWidth: 420, width: "100%",
-    boxShadow: "0 4px 24px rgba(0,0,0,0.3)",
+    display: "flex", alignItems: "center", gap: 16,
+    background: "rgba(255,255,255,0.03)", backdropFilter: "blur(12px)",
+    border: "1px solid var(--border)",
+    borderRadius: 20, padding: "20px 24px",
+    maxWidth: 480, width: "100%",
+    boxShadow: "0 10px 30px rgba(0,0,0,0.4)",
+    animation: "fadeIn 0.6s ease-out",
   },
   stageCardEscalated: {
-    border: `1px solid ${BRAND.accent}60`,
-    background: `rgba(0,201,167,0.08)`,
+    border: "1px solid var(--accent-primary)",
+    background: "rgba(59, 130, 246, 0.05)",
   },
-  stageIcon: { fontSize: 28 },
-  stageLabel: { fontWeight: 700, fontSize: 15, margin: 0 },
-  stageSub: { fontSize: 12, color: BRAND.textMuted, margin: "3px 0 0" },
+  stageIcon: { fontSize: 32 },
+  stageLabel: { fontWeight: 700, fontSize: 18, margin: 0, fontFamily: "var(--font-heading)" },
+  stageSub: { fontSize: 13, color: "var(--text-secondary)", margin: "4px 0 0" },
   caption: {
-    position: "fixed", bottom: 100, left: "50%", transform: "translateX(-50%)",
-    background: "rgba(0,0,0,0.82)", backdropFilter: "blur(8px)",
-    borderRadius: 40, padding: "10px 22px",
-    fontSize: 14, maxWidth: 540, textAlign: "center",
-    border: `1px solid ${BRAND.border}`,
-    display: "flex", alignItems: "center", gap: 8,
-    animation: "fadeUp 0.3s ease",
+    position: "fixed", bottom: 120, left: "50%", transform: "translateX(-50%)",
+    background: "rgba(5,5,5,0.9)", backdropFilter: "blur(12px)",
+    borderRadius: 16, padding: "12px 24px",
+    fontSize: 15, maxWidth: 600, textAlign: "center",
+    border: "1px solid var(--border)",
+    display: "flex", alignItems: "center", gap: 12,
+    boxShadow: "0 10px 40px rgba(0,0,0,0.5)",
   },
   captionDot: {
-    width: 7, height: 7, borderRadius: "50%",
-    background: BRAND.accent, flexShrink: 0,
+    width: 8, height: 8, borderRadius: "50%",
+    background: "var(--accent-primary)", flexShrink: 0,
     animation: "pulse 1.5s infinite",
   },
   netIndicator: {
-    display: "flex", alignItems: "flex-end", gap: 3, height: 24,
+    display: "flex", alignItems: "flex-end", gap: 3, height: 20,
   },
-  netBar: { width: 4, borderRadius: 2, transition: "background 0.3s" },
-  netLabel: { fontSize: 11, marginLeft: 6, fontWeight: 600 },
+  netBar: { width: 3, borderRadius: 2, transition: "background 0.3s" },
+  netLabel: { fontSize: 10, marginLeft: 8, fontWeight: 600, color: "var(--text-tertiary)" },
   controlBar: {
-    display: "flex", justifyContent: "center", gap: 12,
-    padding: "16px 24px", borderTop: `1px solid ${BRAND.border}`,
-    background: "rgba(10,15,30,0.95)", backdropFilter: "blur(12px)",
+    display: "flex", justifyContent: "center", gap: 16,
+    padding: "20px 32px", borderTop: "1px solid var(--border)",
+    background: "rgba(5,5,5,0.95)", backdropFilter: "blur(12px)",
     position: "relative", zIndex: 10,
   },
   ctrlBtn: {
     display: "flex", flexDirection: "column", alignItems: "center",
-    gap: 4, padding: "10px 18px", borderRadius: 12,
-    border: `1px solid ${BRAND.border}`,
-    background: BRAND.surfaceAlt, color: BRAND.text,
-    cursor: "pointer", transition: "all 0.2s",
-    minWidth: 70,
+    gap: 6, padding: "12px 24px", borderRadius: 16,
+    border: "1px solid var(--border)",
+    background: "var(--surface)", color: "var(--text-primary)",
+    cursor: "pointer", transition: "all 0.2s cubic-bezier(0.4, 0, 0.2, 1)",
+    minWidth: 80,
   },
-  ctrlBtnDanger: { background: "#7F1D1D", border: `1px solid ${BRAND.danger}40` },
-  ctrlBtnInactive: { opacity: 0.55 },
+  ctrlBtnDanger: { background: "rgba(239, 68, 68, 0.1)", border: "1px solid rgba(239, 68, 68, 0.3)", color: "var(--error)" },
+  ctrlBtnInactive: { opacity: 0.6, background: "transparent" },
   ctrlBtnDisabled: { opacity: 0.3, cursor: "not-allowed" },
-  ctrlLabel: { fontSize: 10, fontWeight: 600, letterSpacing: "0.03em" },
+  ctrlLabel: { fontSize: 10, fontWeight: 700, letterSpacing: "0.05em", textTransform: "uppercase" },
   joinPrompt: {
     display: "flex", flexDirection: "column", alignItems: "center",
-    textAlign: "center", maxWidth: 420, padding: "40px 24px",
-    position: "relative",
+    textAlign: "center", maxWidth: 480, padding: "60px 40px",
+    background: "var(--surface)", borderRadius: 32, border: "1px solid var(--border)",
+    position: "relative", boxShadow: "0 30px 60px rgba(0,0,0,0.6)",
   },
   joinGlow: {
-    position: "absolute", top: -60, width: 280, height: 280,
+    position: "absolute", top: -100, width: 400, height: 400,
     borderRadius: "50%",
-    background: `radial-gradient(circle, ${BRAND.primary}30, transparent 70%)`,
-    pointerEvents: "none",
+    background: "radial-gradient(circle, var(--accent-glow) 0%, transparent 70%)",
+    filter: "blur(40px)", pointerEvents: "none", opacity: 0.4,
   },
-  joinSubtitle: { fontSize: 16, color: BRAND.textMuted, marginBottom: 24, lineHeight: 1.6 },
-  joinChecklist: { listStyle: "none", padding: 0, margin: "0 0 32px", textAlign: "left" },
+  joinSubtitle: { fontSize: 18, color: "var(--text-secondary)", marginBottom: 32, lineHeight: 1.6 },
+  joinChecklist: { listStyle: "none", padding: 0, margin: "0 0 40px", textAlign: "left", width: "100%" },
   joinCheckItem: {
-    padding: "8px 0", fontSize: 14,
-    display: "flex", alignItems: "center", gap: 10,
-    color: BRAND.text,
+    padding: "12px 0", fontSize: 15,
+    display: "flex", alignItems: "center", gap: 14,
+    color: "var(--text-primary)",
   },
   checkMark: {
-    color: BRAND.accent, fontWeight: 800, fontSize: 16,
-    background: `${BRAND.accent}18`, borderRadius: "50%",
-    width: 24, height: 24, display: "flex", alignItems: "center", justifyContent: "center",
-    flexShrink: 0,
+    color: "var(--accent-primary)", fontWeight: 800, fontSize: 16,
+    background: "var(--surface-hover)", borderRadius: "50%",
+    width: 28, height: 28, display: "flex", alignItems: "center", justifyContent: "center",
+    flexShrink: 0, border: "1px solid var(--border)",
   },
   joinBtn: {
-    padding: "14px 48px", borderRadius: 40,
-    background: `linear-gradient(135deg, ${BRAND.primary}, ${BRAND.accent})`,
+    padding: "16px 48px", borderRadius: 16,
+    background: "var(--accent-primary)",
     border: "none", color: "#fff",
-    fontSize: 16, fontWeight: 700, cursor: "pointer",
-    boxShadow: `0 0 32px ${BRAND.accent}40`,
-    transition: "transform 0.2s, box-shadow 0.2s",
+    fontSize: 17, fontWeight: 700, cursor: "pointer",
+    boxShadow: "0 10px 30px var(--accent-glow)",
+    transition: "all 0.3s ease",
+    width: "100%",
   },
-  joinDisclaimer: { fontSize: 11, color: BRAND.textMuted, marginTop: 16, lineHeight: 1.5 },
+  joinDisclaimer: { fontSize: 12, color: "var(--text-tertiary)", marginTop: 24, lineHeight: 1.6 },
   offerOverlay: {
     position: "fixed", inset: 0, zIndex: 100,
-    background: "rgba(10,15,30,0.85)", backdropFilter: "blur(8px)",
+    background: "rgba(0,0,0,0.9)", backdropFilter: "blur(12px)",
     display: "flex", alignItems: "center", justifyContent: "center",
     padding: 24,
-    animation: "fadeIn 0.4s ease",
   },
   offerCard: {
-    background: BRAND.surfaceAlt, borderRadius: 20,
-    border: `1px solid ${BRAND.accent}40`,
-    padding: 32, maxWidth: 420, width: "100%",
-    boxShadow: `0 0 60px ${BRAND.accent}20`,
+    background: "var(--bg-secondary)", borderRadius: 32,
+    border: "1px solid var(--accent-primary)",
+    padding: 48, maxWidth: 500, width: "100%",
+    boxShadow: "0 0 100px var(--accent-glow)",
     textAlign: "center",
+    animation: "fadeIn 0.8s ease-out",
   },
   documentUploadCard: {
-    position: "absolute",
-    top: "50%", left: "50%", transform: "translate(-50%, -50%)",
-    background: "rgba(17,24,39,0.95)", backdropFilter: "blur(12px)",
-    borderRadius: 20, border: `1px solid ${BRAND.accent}40`,
-    padding: 32, maxWidth: 400, width: "90%",
-    boxShadow: `0 0 40px ${BRAND.accent}20`,
+    background: "var(--bg-secondary)", backdropFilter: "blur(12px)",
+    borderRadius: 32, border: "1px solid var(--border)",
+    padding: 40, maxWidth: 440, width: "100%",
+    boxShadow: "0 20px 60px rgba(0,0,0,0.6)",
     textAlign: "center", zIndex: 100,
-    animation: "fadeIn 0.3s ease",
+    animation: "fadeIn 0.4s ease-out",
   },
   offerBadge: {
     display: "inline-block",
-    background: `${BRAND.accent}18`, color: BRAND.accent,
-    fontSize: 13, fontWeight: 700, borderRadius: 40,
-    padding: "6px 16px", marginBottom: 16,
+    background: "rgba(59, 130, 246, 0.1)", color: "var(--accent-primary)",
+    fontSize: 12, fontWeight: 800, borderRadius: 100,
+    padding: "8px 20px", marginBottom: 24, letterSpacing: "0.05em",
+    textTransform: "uppercase",
   },
   offerAmount: {
-    fontSize: 42, fontWeight: 800, letterSpacing: "-0.03em",
-    background: `linear-gradient(135deg, #fff, ${BRAND.accent})`,
+    fontSize: 56, fontWeight: 800, letterSpacing: "-0.04em",
+    background: "linear-gradient(135deg, #fff 0%, #3b82f6 100%)",
     WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent",
+    marginBottom: 8,
   },
-  offerRate: { color: BRAND.textMuted, fontSize: 14, margin: "4px 0 16px" },
+  offerRate: { color: "var(--text-secondary)", fontSize: 18, marginBottom: 24, fontWeight: 500 },
   offerExplanation: {
-    fontSize: 14, color: BRAND.textMuted, lineHeight: 1.6,
-    margin: "0 0 20px", textAlign: "left",
+    fontSize: 15, color: "var(--text-secondary)", lineHeight: 1.6,
+    margin: "0 0 32px", textAlign: "left",
+    background: "rgba(255,255,255,0.02)", padding: 20, borderRadius: 16,
   },
-  offerTitle: { fontSize: 26, fontWeight: 800, margin: "0 0 12px" },
-  tenureRow: { display: "flex", gap: 8, justifyContent: "center", marginBottom: 16 },
+  offerTitle: { fontSize: 32, fontWeight: 800, margin: "0 0 16px", fontFamily: "var(--font-heading)" },
+  tenureRow: { display: "flex", gap: 12, justifyContent: "center", marginBottom: 24 },
   tenureBtn: {
-    padding: "8px 18px", borderRadius: 40,
-    border: `1px solid ${BRAND.border}`,
-    background: "transparent", color: BRAND.textMuted,
-    cursor: "pointer", fontSize: 14, fontWeight: 600,
+    padding: "10px 24px", borderRadius: 12,
+    border: "1px solid var(--border)",
+    background: "var(--surface)", color: "var(--text-secondary)",
+    cursor: "pointer", fontSize: 15, fontWeight: 600,
     transition: "all 0.2s",
   },
   tenureBtnActive: {
-    background: BRAND.accent, border: `1px solid ${BRAND.accent}`,
-    color: "#000",
+    background: "var(--accent-primary)", border: "1px solid var(--accent-primary)",
+    color: "#fff", boxShadow: "0 0 15px var(--accent-glow)",
   },
   emiDisplay: {
-    fontSize: 14, color: BRAND.textMuted, marginBottom: 24,
+    fontSize: 16, color: "var(--text-primary)", marginBottom: 32,
+    padding: "16px", background: "rgba(255,255,255,0.03)", borderRadius: 12,
   },
   offerActions: {
-    display: "flex", flexDirection: "column", gap: 12, alignItems: "center",
+    display: "flex", flexDirection: "column", gap: 16, alignItems: "center",
   },
   acceptBtn: {
-    width: "100%", padding: "14px", borderRadius: 12,
-    background: `linear-gradient(135deg, ${BRAND.primary}, ${BRAND.accent})`,
+    width: "100%", padding: "18px", borderRadius: 16,
+    background: "var(--accent-primary)",
     border: "none", color: "#fff",
-    fontSize: 16, fontWeight: 700, cursor: "pointer",
+    fontSize: 18, fontWeight: 700, cursor: "pointer",
+    boxShadow: "0 10px 30px var(--accent-glow)",
   },
   kfsLink: {
-    fontSize: 12, color: BRAND.accent, textDecoration: "none",
+    fontSize: 13, color: "var(--text-tertiary)", textDecoration: "none",
+    marginTop: 8, transition: "color 0.2s",
   },
   errorNotification: {
-    position: "fixed", top: 80, left: "50%", transform: "translateX(-50%)",
-    zIndex: 50, background: "#7F1D1D", border: `1px solid ${BRAND.danger}60`,
-    color: BRAND.text, padding: "12px 20px", borderRadius: 12,
+    position: "fixed", top: 100, left: "50%", transform: "translateX(-50%)",
+    zIndex: 50, background: "rgba(239, 68, 68, 0.95)", backdropFilter: "blur(12px)",
+    color: "#fff", padding: "16px 24px", borderRadius: 16,
     display: "flex", alignItems: "center", justifyContent: "space-between",
-    gap: 16, maxWidth: 500, width: "90%",
-    boxShadow: "0 8px 32px rgba(0,0,0,0.5)",
-    animation: "slideDown 0.3s ease",
-    fontSize: 14,
+    gap: 20, maxWidth: 500, width: "90%",
+    boxShadow: "0 10px 40px rgba(239, 68, 68, 0.3)",
+    animation: "fadeIn 0.3s ease",
+    fontSize: 15, fontWeight: 600,
   },
   errorClose: {
-    background: "none", border: "none", color: BRAND.text,
-    fontSize: 18, cursor: "pointer", padding: 0,
+    background: "rgba(255,255,255,0.2)", border: "none", color: "#fff",
+    width: 28, height: 28, borderRadius: "50%", cursor: "pointer",
     display: "flex", alignItems: "center", justifyContent: "center",
   },
   agentSpeechBubble: {
-    position: "fixed", bottom: 110, left: "50%", transform: "translateX(-50%)",
-    background: "rgba(10,15,30,0.9)", backdropFilter: "blur(12px)",
-    borderRadius: 12, padding: "14px 24px",
-    maxWidth: 600, width: "90%",
-    border: `1px solid ${BRAND.primary}50`,
-    boxShadow: "0 8px 32px rgba(0,0,0,0.4)",
-    animation: "slideUp 0.4s ease",
+    position: "fixed", bottom: 120, left: "50%", transform: "translateX(-50%)",
+    background: "rgba(10,10,10,0.85)", backdropFilter: "blur(16px)",
+    borderRadius: 24, padding: "20px 32px",
+    maxWidth: 700, width: "90%",
+    border: "1px solid var(--accent-primary)",
+    boxShadow: "0 20px 50px rgba(0,0,0,0.6)",
+    animation: "fadeIn 0.5s ease-out",
     textAlign: "left",
   },
   recordingTimer: {
-    display: "flex", alignItems: "center", gap: 6,
-    background: "rgba(255, 71, 87, 0.15)",
-    border: `1px solid ${BRAND.danger}40`,
-    padding: "4px 10px", borderRadius: 20,
-    color: BRAND.danger, fontSize: 12, fontWeight: 700,
+    display: "flex", alignItems: "center", gap: 8,
+    background: "rgba(239, 68, 68, 0.1)",
+    border: "1px solid rgba(239, 68, 68, 0.2)",
+    padding: "6px 14px", borderRadius: 100,
+    color: "var(--error)", fontSize: 12, fontWeight: 800,
     letterSpacing: "0.05em",
   },
   recordDot: {
     width: 8, height: 8, borderRadius: "50%",
-    background: BRAND.danger,
+    background: "var(--error)",
     animation: "pulse 1.5s infinite",
   },
   volBar: {
-    width: 3, borderRadius: 2, background: BRAND.accent,
+    width: 3, borderRadius: 2, background: "var(--accent-primary)",
     transition: "height 0.1s ease",
   },
   debugOverlay: {
-    position: "absolute", top: 100, right: 32,
-    background: "rgba(255, 100, 0, 0.8)", color: "#fff",
-    padding: "8px 16px", borderRadius: 8, fontSize: 13,
+    position: "absolute", top: 120, right: 32,
+    background: "rgba(0,0,0,0.8)", color: "#fff",
+    padding: "10px 20px", borderRadius: 12, fontSize: 12,
     maxWidth: 300, zIndex: 50, fontFamily: "monospace",
+    border: "1px solid rgba(255,255,255,0.1)",
   },
 };
 
@@ -1288,10 +1328,10 @@ function DocumentUploadOverlay({ callId }) {
   if (success) {
     return (
       <div style={styles.documentUploadCard}>
-        <div style={{ fontSize: 32, marginBottom: 8 }}>✅</div>
-        <h3 style={{ margin: 0, fontSize: 18 }}>Document Uploaded!</h3>
-        <p style={{ fontSize: 13, color: BRAND.textMuted, margin: "8px 0 0" }}>
-          Please wait while we verify your identity...
+        <div style={{ fontSize: 48, marginBottom: 16 }}>✅</div>
+        <h3 style={{ margin: 0, fontSize: 24, fontFamily: "var(--font-heading)" }}>Verification Started</h3>
+        <p style={{ fontSize: 15, color: "var(--text-secondary)", margin: "12px 0 0", lineHeight: 1.6 }}>
+          Your document is being processed by our AI vision agents. This usually takes 10-15 seconds.
         </p>
       </div>
     );
@@ -1299,21 +1339,28 @@ function DocumentUploadOverlay({ callId }) {
 
   return (
     <div style={styles.documentUploadCard}>
-      <h3 style={{ margin: "0 0 12px 0", fontSize: 18 }}>Upload Identity Document</h3>
-      <p style={{ fontSize: 13, color: BRAND.textMuted, margin: "0 0 16px 0", lineHeight: 1.4 }}>
-        Please upload a clear photo of your original Aadhaar or PAN card to proceed.
+      <div style={{ fontSize: 32, marginBottom: 20 }}>📄</div>
+      <h3 style={{ margin: "0 0 12px 0", fontSize: 24, fontFamily: "var(--font-heading)" }}>Identity Document</h3>
+      <p style={{ fontSize: 15, color: "var(--text-secondary)", margin: "0 0 24px 0", lineHeight: 1.6 }}>
+        Please upload a high-quality photo of your original Aadhaar or PAN card.
       </p>
-      <input 
-        type="file" 
-        accept="image/*" 
-        onChange={(e) => setFile(e.target.files[0])}
-        style={{ marginBottom: 16, width: "100%", fontSize: 13 }}
-      />
+      
+      <div className="file-input-wrapper">
+        <input 
+          type="file" 
+          accept="image/*" 
+          id="doc-upload"
+          onChange={(e) => setFile(e.target.files[0])}
+          style={{ display: "none" }}
+        />
+        <label htmlFor="doc-upload" className="btn-outline" style={{ display: "block", marginBottom: 24, cursor: "pointer", textAlign: "center" }}>
+          {file ? file.name : "Choose File"}
+        </label>
+      </div>
+
       <button 
+        className="btn-primary"
         style={{
-          ...styles.joinBtn, 
-          padding: "10px 24px", 
-          fontSize: 14, 
           width: "100%",
           opacity: (!file || uploading) ? 0.6 : 1,
           cursor: (!file || uploading) ? "not-allowed" : "pointer"
@@ -1321,8 +1368,16 @@ function DocumentUploadOverlay({ callId }) {
         onClick={handleUpload}
         disabled={!file || uploading}
       >
-        {uploading ? "Uploading..." : "Upload Document"}
+        {uploading ? "Analyzing..." : "Confirm & Upload"}
       </button>
+      
+      <style jsx>{`
+        .file-input-wrapper label {
+          padding: 12px;
+          border-radius: 12px;
+          font-size: 14px;
+        }
+      `}</style>
     </div>
   );
 }
@@ -1330,8 +1385,12 @@ function DocumentUploadOverlay({ callId }) {
 const keyframes = `
   @keyframes pulse {
     0% { opacity: 1; transform: scale(1); }
-    50% { opacity: 0.5; transform: scale(0.8); }
+    50% { opacity: 0.5; transform: scale(0.9); }
     100% { opacity: 1; transform: scale(1); }
+  }
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(20px); }
+    to { opacity: 1; transform: translateY(0); }
   }
 `;
 if (typeof document !== "undefined") {
@@ -1339,3 +1398,4 @@ if (typeof document !== "undefined") {
   style.innerHTML = keyframes;
   document.head.appendChild(style);
 }
+
