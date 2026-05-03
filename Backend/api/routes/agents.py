@@ -45,6 +45,8 @@ async def accept_offer(call_id: str, req: OfferAcceptRequest):
 
     if offer.eligible_amount is None:
         raise HTTPException(status_code=400, detail="No active offer for this session")
+    if offer.acceptance_status == "ELIGIBILITY_PENDING_DOCS":
+        raise HTTPException(status_code=409, detail="Eligibility pending documents. Offer cannot be accepted yet.")
 
     offer.acceptance_status  = "ACCEPTED"
     offer.accepted_tenure    = req.tenure

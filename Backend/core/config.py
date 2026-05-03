@@ -40,8 +40,11 @@ class Settings(BaseSettings):
 
     # ── LLM (local) ───────────────────────────────────────────────────────────
     OLLAMA_BASE_URL: str = "http://localhost:11434"
-    LLM_MODEL_LARGE: str = "gemma3:27b"    # Offer Agent
+    LLM_MODEL_LARGE: str = "llama3.1:8b"   # Offer Agent (use llama3.1:8b until gemma3:27b is pulled)
     LLM_MODEL_SMALL: str = "llama3.1:8b"   # Conversation Agent
+    LLM_DEFAULT_TEMPERATURE: float = 0.0
+    LLM_DEFAULT_TOP_P: float = 0.1
+    LLM_GATEWAY_ONLY: bool = True
 
     # ── Text-to-Speech (TTS) ──────────────────────────────────────────────────
     TTS_PROVIDER: str = "edge"              # edge | elevenlabs | local (pyttsx3)
@@ -62,8 +65,8 @@ class Settings(BaseSettings):
     WHISPER_CONFIDENCE_THRESHOLD: float = 0.75
 
     # ── Vision ────────────────────────────────────────────────────────────────
-    YOLO_MODEL_PATH: str = "models/yolov8n-face.pt"
-    VISION_CONFIDENCE_THRESHOLD: float = 0.70
+    YOLO_MODEL_PATH: str = "yolov8n.pt"
+    VISION_CONFIDENCE_THRESHOLD: float = 0.50
 
     # ── Credit Bureau (mock for MVP) ──────────────────────────────────────────
     BUREAU_API_URL: str = "http://localhost:8000/api/v1/bureau"
@@ -71,6 +74,9 @@ class Settings(BaseSettings):
 
     # ── Human Oversight ───────────────────────────────────────────────────────
     HUMAN_ESCALATION_QUEUE: str = "human_oversight"
+    STRICT_SUPERVISOR: bool = True
+    ZERO_TRUST_INCOME: bool = True
+    GEO_HARD_GATE: bool = True
 
     model_config = SettingsConfigDict(
         env_file=(PROJECT_ROOT / ".env", BACKEND_DIR / ".env"),

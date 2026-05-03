@@ -15,13 +15,12 @@ import json
 import time
 from typing import Optional
 
-import httpx
-
 from models.shared_state import SharedState, LoanOffer, RiskBand
 from core.redis_client import redis_client
 from core.rabbitmq_client import rabbitmq_client
 from core.config import settings
 from core.langgraph_engine import moderator_engine
+from services.llm_gateway import llm_gateway
 
 logger = logging.getLogger(__name__)
 
@@ -88,12 +87,15 @@ class OfferAgent:
 
         if not eligibility["eligible"]:
             logger.info(f"Customer ineligible: {call_id} | reason: {eligibility['reason']}")
-            state.final_offer.acceptance_status = "DECLINED_INELIGIBLE"
+            pending_docs = eligibility.get("status") == "ELIGIBILITY_PENDING_DOCS"
+            state.final_offer.acceptance_status = "ELIGIBILITY_PENDING_DOCS" if pending_docs else "DECLINED_INELIGIBLE"
+            if pending_docs:
+                state.financial_data.income_verification_source = "pending_docs"
             state.version += 1
             await redis_client.set_state(state.redis_key(), state.to_json())
 
             await redis_client.publish(f"session:{call_id}:events", {
-                "event":   "OFFER_DECLINED_INELIGIBLE",
+                "event":   "ELIGIBILITY_PENDING_DOCS" if pending_docs else "OFFER_DECLINED_INELIGIBLE",
                 "reason":  eligibility["reason"],
                 "call_id": call_id,
             })
@@ -107,7 +109,7 @@ class OfferAgent:
             return
 
         # ── Phase 2: LLM explanation ──────────────────────────────────────────
-        explanation = await self._generate_explanation(state, eligibility)
+        explanation = await self._generate_explanation(call_id, state, eligibility)
 
         # Build offer object
         offer = LoanOffer(
@@ -157,13 +159,20 @@ class OfferAgent:
         LLM is NOT used here – numbers come from state directly.
         """
         fd        = state.financial_data
-        income    = fd.verified_income or fd.monthly_income or 0
+        income    = fd.verified_income or 0
         cibil     = fd.bureau_score or 0
         risk_band = fd.risk_band
         foir      = fd.foir or 0.0
         existing_emi = fd.existing_emi_total or 0
 
         # ── Rejection checks ─────────────────────────────────────────────
+
+        if income <= 0:
+            return {
+                "eligible": False,
+                "status": "ELIGIBILITY_PENDING_DOCS",
+                "reason": "Verified income missing. Please upload income proof to continue.",
+            }
 
         if risk_band == RiskBand.HIGH:
             return {"eligible": False, "reason": "Risk band HIGH – refer to human review"}
@@ -275,7 +284,7 @@ class OfferAgent:
 
     # ── LLM Explanation ───────────────────────────────────────────────────────
 
-    async def _generate_explanation(self, state: SharedState, eligibility: dict) -> str:
+    async def _generate_explanation(self, call_id: str, state: SharedState, eligibility: dict) -> str:
         """
         Gemma 3 27B generates a plain-language, personalised offer explanation.
         This is the ONLY place LLM is used in offer generation.
@@ -302,20 +311,23 @@ EMI for 24 months: ₹{emi24:,.0f}/month
 
 Write ONLY the 2-sentence explanation. Be warm and encouraging. Mention their name."""
 
-        try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.post(
-                    f"{settings.OLLAMA_BASE_URL}/api/generate",
-                    json={
-                        "model":  settings.LLM_MODEL_LARGE,
-                        "prompt": prompt,
-                        "stream": False,
-                    },
-                )
-                if resp.status_code == 200:
-                    return resp.json().get("response", "").strip()
-        except Exception as e:
-            logger.error(f"LLM explanation error: {e}")
+        # 1. Trigger filler speech immediately via Redis (Frontend picks this up)
+        # This covers the 6-7 second latency of the local LLM
+        await redis_client.publish(f"session:{call_id}:events", {
+            "event": "AGENT_SPEECH",
+            "text": f"One moment {name}, I'm just running your details through our eligibility engine to find the best offer for you...",
+            "is_filler": True,
+            "call_id": call_id
+        })
+
+        text = await llm_gateway.generate_text(
+            model=settings.LLM_MODEL_LARGE,
+            prompt=prompt,
+            num_predict=60,
+            timeout=15,
+        )
+        if text:
+            return text
 
         # Fallback: template-based explanation
         return (

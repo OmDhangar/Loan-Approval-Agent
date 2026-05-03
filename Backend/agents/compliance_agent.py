@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from models.shared_state import SharedState
 from core.redis_client import redis_client
 from core.config import settings
+from core.rabbitmq_client import rabbitmq_client
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +93,14 @@ class ComplianceAgent:
 
         if not state.session_meta.videosdk_recording_id:
             issues.append("recording_not_active")
+        geo_distance = state.financial_data.geo_distance_km
+        if geo_distance is not None and geo_distance > 50:
+            issues.append(f"geo_distance_gt_50km:{geo_distance}")
+            await rabbitmq_client.publish_task("human_oversight", {
+                "call_id": call_id,
+                "reason": "geo_mismatch_gt_50km",
+                "distance_km": geo_distance,
+            })
 
         # Archive compliance check to audit log
         await self._write_audit_event(call_id, "COMPLIANCE_OFFER_VALIDATION", {

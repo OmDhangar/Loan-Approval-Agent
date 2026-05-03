@@ -12,16 +12,19 @@ from dataclasses import dataclass, field, asdict
 
 
 class SessionStage(str, Enum):
-    INIT                = "INIT"
-    GREETING_CONSENT    = "GREETING_CONSENT"
-    IDENTITY_KYC        = "IDENTITY_KYC"
-    EMPLOYMENT_INCOME   = "EMPLOYMENT_INCOME"
-    LOAN_PURPOSE        = "LOAN_PURPOSE"
-    RISK_ASSESSMENT     = "RISK_ASSESSMENT"
-    OFFER_ACCEPTANCE    = "OFFER_ACCEPTANCE"
-    COMPLETED           = "COMPLETED"
-    ESCALATED           = "ESCALATED"
-    ABANDONED           = "ABANDONED"
+    INIT                  = "INIT"
+    GREETING_CONSENT      = "GREETING_CONSENT"
+    OVD_DOCUMENT_CAPTURE  = "OVD_DOCUMENT_CAPTURE"      # V-CIP: show Aadhaar/PAN on camera
+    LIVENESS_CHALLENGE    = "LIVENESS_CHALLENGE"          # V-CIP: blink/head turn/read OTP
+    AADHAAR_VERIFICATION  = "AADHAAR_VERIFICATION"        # V-CIP: OTP-based e-KYC
+    IDENTITY_KYC          = "IDENTITY_KYC"                # Cross-verify name/DOB against bureau
+    EMPLOYMENT_INCOME     = "EMPLOYMENT_INCOME"
+    LOAN_PURPOSE          = "LOAN_PURPOSE"
+    RISK_ASSESSMENT       = "RISK_ASSESSMENT"
+    OFFER_ACCEPTANCE      = "OFFER_ACCEPTANCE"
+    COMPLETED             = "COMPLETED"
+    ESCALATED             = "ESCALATED"
+    ABANDONED             = "ABANDONED"
 
 
 class RiskBand(str, Enum):
@@ -61,6 +64,15 @@ class CustomerIdentity:
     consent_given: bool = False
     consent_phrase: Optional[str] = None
     consent_timestamp: Optional[float] = None
+    # ── V-CIP and bureau verification fields ─────────────────────────────
+    identity_verified: bool = False               # True if name+DOB match bureau
+    bureau_verified_name: Optional[str] = None    # Name from bureau KYC data
+    ovd_type: Optional[str] = None                # "aadhaar" | "pan" | "passport"
+    ovd_number_masked: Optional[str] = None       # Masked OVD number shown on camera
+    ovd_photo_match_score: Optional[float] = None # Face match score vs OVD photo
+    liveness_challenge_passed: bool = False        # V-CIP liveness challenge result
+    liveness_challenge_type: Optional[str] = None  # "blink" | "head_turn" | "read_otp"
+    aadhaar_otp_verified: bool = False             # OTP-based Aadhaar verification
 
 
 @dataclass
@@ -84,6 +96,8 @@ class FinancialData:
     employment_stability_years: Optional[float] = None   # Years at current employment
     fraud_flags: List[str] = field(default_factory=list) # Active fraud alerts
     composite_risk_score: Optional[float] = None         # 0-100 composite score
+    income_verification_source: Optional[str] = None     # bureau_verified / unavailable / pending_docs
+    geo_distance_km: Optional[float] = None              # Device/IP vs declared geo distance
 
 
 @dataclass
@@ -111,6 +125,17 @@ class ModeratorLogEntry:
     action_taken: str
     confidence: float
     escalated_to_human: bool = False
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
+class WorkerDeltaEvent:
+    """Supervisor-owned state patch contract emitted by workers."""
+    call_id: str
+    agent: str
+    expected_version: int
+    idempotency_key: str
+    delta: Dict[str, Any]
     timestamp: float = field(default_factory=time.time)
 
 

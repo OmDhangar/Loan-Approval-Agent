@@ -25,6 +25,7 @@ from core.redis_client import redis_client
 from core.config import settings
 from core.langgraph_engine import moderator_engine
 from services.bureau_client import bureau_client
+from services.geolocation_service import geolocation_service
 
 logger = logging.getLogger(__name__)
 
@@ -75,12 +76,16 @@ class RiskAgent:
         state.financial_data.composite_risk_score = composite
 
         # 4. Geo mismatch check
-        geo_ok, geo_dist = self._check_geo(state)
+        geo_ok, geo_dist = self._check_geo(state, report)
+        state.financial_data.geo_distance_km = geo_dist
         if not geo_ok:
-            reasons.append("geo_mismatch")
+            reasons.append("geo_mismatch_gt_50km")
 
         # 5. Edge case overrides
         risk_band, escalate = self._apply_edge_cases(composite, state, report, reasons)
+        if not geo_ok:
+            escalate = True
+            risk_band = RiskBand.HIGH
         state.financial_data.risk_band = risk_band
 
         # 6. Store propensity score (backward-compatible)
@@ -149,7 +154,7 @@ class RiskAgent:
                 "delinquency": {"dpd_30_plus_last_12m": 0, "dpd_60_plus_last_12m": 0, "dpd_90_plus_ever": 0, "written_off": False, "max_dpd_last_24m": 0},
             },
             "income_profile": {
-                "declared_monthly": income, "verified_monthly": income,
+                "declared_monthly": income, "verified_monthly": None,
                 "employment_type": state.financial_data.employment_type or "SALARIED",
                 "employment_stability_years": 2.0, "salary_mode": "BANK_TRANSFER",
             },
@@ -178,8 +183,11 @@ class RiskAgent:
         verified = bureau_client.extract_income(report)
         if verified:
             fd.verified_income = verified
+            fd.income_verification_source = "bureau_verified"
             if not fd.monthly_income:
                 fd.monthly_income = verified
+        elif fd.verified_income is None:
+            fd.income_verification_source = "unavailable"
 
         # Debt burden
         fd.foir = bureau_client.extract_foir(report)
@@ -243,7 +251,7 @@ class RiskAgent:
         breakdown["credit_score"] = round(credit_sub, 1)
 
         # ── 2. Income & Stability Component (20%) ────────────────────────
-        income = fd.verified_income or fd.monthly_income or 0
+        income = fd.verified_income or 0
         emp_years = fd.employment_stability_years or 0
 
         # Income sub-score: normalised against 150K (saturation point)
@@ -439,19 +447,29 @@ class RiskAgent:
 
     # ── Geo Check (unchanged from original) ───────────────────────────────────
 
-    def _check_geo(self, state: SharedState) -> tuple[bool, Optional[float]]:
+    def _check_geo(self, state: SharedState, report: Optional[dict]) -> tuple[bool, Optional[float]]:
         """
         Cross-verify device geo (lat/lng captured at session start)
         vs. declared city (derived from income/employment data).
         MVP: returns (True, 0) — geo mismatch detection requires IP-to-city DB.
         Production: MaxMind GeoIP2 + Haversine formula.
         """
+        observed = None
         lat = state.session_meta.geo_lat
         lng = state.session_meta.geo_lng
+        if lat is not None and lng is not None:
+            observed = (lat, lng)
+        if observed is None:
+            observed = geolocation_service.resolve_ip_coords(state.session_meta.ip_address)
 
-        if lat is None or lng is None:
-            return True, None   # No geo data → don't penalise
+        declared = geolocation_service.resolve_declared_coords(report)
+        if observed is None or declared is None:
+            return True, None
 
-        # Production: compare against declared city coordinates
-        # For MVP: assume OK
-        return True, 0.0
+        distance_km = geolocation_service.haversine_km(
+            observed[0],
+            observed[1],
+            declared[0],
+            declared[1],
+        )
+        return distance_km <= self.GEO_MISMATCH_KM, round(distance_km, 2)

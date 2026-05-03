@@ -3,7 +3,7 @@ Redis Client – SharedState persistence layer
 """
 import json
 import logging
-from typing import Optional
+from typing import Optional, Any
 
 import redis.asyncio as aioredis
 
@@ -36,6 +36,53 @@ class RedisClient:
             state_json,
             ex=ttl or settings.REDIS_STATE_TTL_SECONDS,
         )
+
+    async def compare_and_set_state(
+        self,
+        key: str,
+        expected_version: int,
+        patch: dict[str, Any],
+        ttl: int | None = None,
+    ) -> tuple[bool, int]:
+        """
+        Atomically patch state iff current version == expected_version.
+        Returns (updated, resulting_version).
+        """
+        ttl_seconds = ttl or settings.REDIS_STATE_TTL_SECONDS
+        while True:
+            async with self._client.pipeline() as pipe:
+                try:
+                    await pipe.watch(key)
+                    raw = await pipe.get(key)
+                    if raw is None:
+                        await pipe.reset()
+                        return False, -1
+
+                    state_obj = json.loads(raw)
+                    current_version = int(state_obj.get("version", 0))
+                    if current_version != expected_version:
+                        await pipe.reset()
+                        return False, current_version
+
+                    merged = self._deep_merge_dict(state_obj, patch)
+                    merged["version"] = current_version + 1
+
+                    pipe.multi()
+                    pipe.set(key, json.dumps(merged), ex=ttl_seconds)
+                    await pipe.execute()
+                    return True, merged["version"]
+                except aioredis.WatchError:
+                    continue
+
+    @staticmethod
+    def _deep_merge_dict(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+        out = dict(base)
+        for key, value in patch.items():
+            if isinstance(value, dict) and isinstance(out.get(key), dict):
+                out[key] = RedisClient._deep_merge_dict(out[key], value)
+            else:
+                out[key] = value
+        return out
 
     async def get_state(self, key: str) -> Optional[str]:
         return await self._client.get(key)

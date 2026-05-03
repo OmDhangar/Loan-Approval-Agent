@@ -199,6 +199,14 @@ async def join_session(session_token: str, request: Request):
             state.version += 1
         state.session_meta.videosdk_participant_id = participant_id
         state.session_meta.ip_address = request.client.host if request.client else None
+        geo_lat = request.headers.get("x-geo-lat")
+        geo_lng = request.headers.get("x-geo-lng")
+        try:
+            if geo_lat and geo_lng:
+                state.session_meta.geo_lat = float(geo_lat)
+                state.session_meta.geo_lng = float(geo_lng)
+        except ValueError:
+            logger.warning(f"Invalid geo headers provided for {call_id}")
         await redis_client.set_state(state.redis_key(), state.to_json())
 
     # Start recording immediately (RBI requirement)
@@ -348,6 +356,13 @@ async def receive_transcript(call_id: str, payload: TranscriptPayload):
     if not payload.text.strip():
         return {"status": "ignored", "reason": "empty transcript"}
 
+    # Short-window dedupe for repeated browser interim/final transcript echoes.
+    normalized = " ".join(payload.text.strip().lower().split())
+    dedupe_key = f"session:{call_id}:stt-dedupe:{normalized}"
+    if not await redis_client.set_once(dedupe_key, "1", ttl_seconds=4):
+        logger.info(f"Duplicate transcript ignored [{call_id}]: \"{payload.text[:60]}\"")
+        return {"status": "ignored", "reason": "duplicate transcript"}
+
     # Queue to STT pipeline (same format as the VideoSDK webhook used)
     from core.rabbitmq_client import rabbitmq_client
     await rabbitmq_client.publish_task("stt_pipeline", {
@@ -413,6 +428,55 @@ async def upload_recording(call_id: str, file: UploadFile = File(...)):
         "filename": filename,
         "size_mb": round(file_size_mb, 2),
     }
+
+
+# ── Document Upload ──────────────────────────────────────────────────────────
+
+DOCUMENTS_DIR = Path("documents")
+DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
+
+@router.post("/{call_id}/upload-document")
+async def upload_document(call_id: str, file: UploadFile = File(...)):
+    """
+    Receive uploaded KYC document (Aadhaar/PAN) from the user.
+    """
+    raw = await redis_client.get_state(f"session:{call_id}:state")
+    if not raw:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Save document
+    session_dir = DOCUMENTS_DIR / call_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+    
+    # We can use original filename or generate a safe one
+    safe_filename = f"{int(time.time())}_{file.filename}"
+    filepath = session_dir / safe_filename
+    
+    async with aiofiles.open(filepath, "wb") as f:
+        content = await file.read()
+        await f.write(content)
+        
+    state = SharedState.from_json(raw)
+    
+    # Simple heuristic to determine type from filename for MVP
+    doc_type = "aadhaar" if "aadhaar" in file.filename.lower() else "pan"
+    if "pan" in file.filename.lower(): doc_type = "pan"
+    
+    state.customer_identity.ovd_type = doc_type
+    state.version += 1
+    await redis_client.set_state(state.redis_key(), state.to_json())
+
+    logger.info(f"Document uploaded for {call_id}: {safe_filename} ({doc_type})")
+
+    # If we are in OVD stage, advance the stage directly
+    if state.current_stage == SessionStage.OVD_DOCUMENT_CAPTURE:
+        await moderator_engine.advance_stage(call_id, {
+            "passed": True,
+            "agent": "vision_document_upload",
+            "confidence": 1.0
+        })
+
+    return {"status": "uploaded", "filename": safe_filename, "type": doc_type}
 
 
 # ── TTS Audio Serving ─────────────────────────────────────────────────────────
@@ -481,13 +545,8 @@ async def receive_snapshot(call_id: str, payload: SnapshotPayload):
         ttl=30,
     )
 
-    # Trigger vision agent processing via RabbitMQ
-    from core.rabbitmq_client import rabbitmq_client
-    await rabbitmq_client.publish_task("vision", {
-        "call_id": call_id,
-        "action": "run_liveness_age_check",
-        "source": "canvas_snapshot",
-    })
+    # Supervisor-controlled vision routing
+    await moderator_engine.handle_snapshot_received(call_id)
 
     logger.debug(f"Snapshot received and queued for vision processing: {call_id}")
     return {"status": "received", "call_id": call_id}

@@ -11,6 +11,7 @@ re-processes with Whisper large-v3 for:
 
 import importlib
 import logging
+import re
 import time
 from typing import Optional
 
@@ -18,8 +19,8 @@ import numpy as np
 
 from models.shared_state import SharedState, ConversationEntry
 from core.redis_client import redis_client
-from core.rabbitmq_client import rabbitmq_client
 from core.config import settings
+from core.langgraph_engine import moderator_engine
 
 logger = logging.getLogger(__name__)
 
@@ -58,8 +59,9 @@ class STTPipeline:
         1. Accept VideoSDK transcript as baseline
         2. Compute confidence from Whisper logprobs if audio available
         3. Extract entities with local LLM
-        4. Write to Shared State conversation_log
-        5. Signal Moderator if confidence below threshold
+        4. Validate entities before writing to state
+        5. Write to Shared State conversation_log
+        6. Signal Moderator if confidence below threshold
         """
         raw = await redis_client.get_state(f"session:{call_id}:state")
         if not raw:
@@ -76,7 +78,7 @@ class STTPipeline:
         # Entity extraction via local LLM
         entities = await self._extract_entities(transcript, state.current_stage.value)
 
-        # Update shared state with entities
+        # Validate and apply entities (with stage-aware validation)
         self._apply_entities(state, entities)
 
         # Append to conversation log
@@ -101,31 +103,19 @@ class STTPipeline:
             "call_id":    call_id,
         })
 
-        # Signal Moderator if confidence too low
-        if confidence < settings.WHISPER_CONFIDENCE_THRESHOLD:
-            logger.warning(f"Low STT confidence ({confidence:.2f}) for {call_id}")
-            await rabbitmq_client.publish_task("conversation", {
-                "call_id": call_id,
-                "action":  "re_ask_last_question",
-                "reason":  "low_stt_confidence",
-                "confidence": confidence,
-            })
-        elif state.current_stage.value == "GREETING_CONSENT" and not state.customer_identity.consent_given:
-            logger.warning(f"STT confidence good but consent not extracted for {call_id}. Re-asking.")
-            await rabbitmq_client.publish_task("conversation", {
-                "call_id": call_id,
-                "action":  "re_ask_last_question",
-                "reason":  "missing_consent",
-                "confidence": confidence,
-            })
-        else:
-            # Trigger conversation agent to advance the stage based on valid input
-            logger.info(f"Final pipeline check: confidence={confidence:.2f}, stage={state.current_stage.value}, consent={state.customer_identity.consent_given}. Advancing {call_id}.")
-            await rabbitmq_client.publish_task("conversation", {
-                "call_id": call_id,
-                "action":  "confirm_and_advance",
-                "confidence": confidence,
-            })
+        await redis_client.publish(f"session:{call_id}:events", {
+            "event": "STT_PROCESSED",
+            "call_id": call_id,
+            "stage": state.current_stage.value,
+            "confidence": confidence,
+            "consent_present": state.customer_identity.consent_given,
+        })
+        await moderator_engine.handle_stt_processed(
+            call_id=call_id,
+            confidence=confidence,
+            consent_present=state.customer_identity.consent_given,
+            stage=state.current_stage.value,
+        )
 
     def _estimate_confidence(self, transcript: str) -> float:
         """
@@ -142,14 +132,17 @@ class STTPipeline:
         Use local LLM (Ollama) to extract structured entities from transcript.
         Prompt is stage-aware to focus extraction.
         """
-        import httpx
+        from services.llm_gateway import llm_gateway
         stage_hints = {
-            "GREETING_CONSENT":   "Look for: consent phrases like 'I agree', 'yes I consent', name",
-            "IDENTITY_KYC":       "Look for: full name, date of birth (DD/MM/YYYY), Aadhaar last 4 digits",
-            "EMPLOYMENT_INCOME":  "Look for: employment type (salaried/self-employed), employer name, monthly income in rupees",
-            "LOAN_PURPOSE":       "Look for: loan purpose, amount needed, repayment period in months",
-            "RISK_ASSESSMENT":    "No extraction needed",
-            "OFFER_ACCEPTANCE":   "Look for: acceptance or rejection of offer, selected tenure",
+            "GREETING_CONSENT":      "Look for: consent phrases like 'I agree', 'yes I consent', name",
+            "OVD_DOCUMENT_CAPTURE":  "Look for: document type mentioned (aadhaar, PAN, pan card), any document number",
+            "LIVENESS_CHALLENGE":    "Look for: confirmation of completing the liveness check, 'done', 'okay', 'I did it'",
+            "AADHAAR_VERIFICATION":  "Look for: a 6-digit OTP number",
+            "IDENTITY_KYC":          "Look for: full name (first name + last name), date of birth (DD/MM/YYYY or spoken format)",
+            "EMPLOYMENT_INCOME":     "Look for: employment type (salaried/self-employed), employer name, monthly income in rupees",
+            "LOAN_PURPOSE":          "Look for: loan purpose, amount needed, repayment period in months",
+            "RISK_ASSESSMENT":       "No extraction needed",
+            "OFFER_ACCEPTANCE":      "Look for: acceptance or rejection of offer, selected tenure",
         }
         hint = stage_hints.get(stage, "Extract any relevant financial or identity information")
 
@@ -159,30 +152,17 @@ Hint: {hint}
 Transcript: "{transcript}"
 
 Respond ONLY with valid JSON. Example:
-{{"name": null, "dob": null, "income": null, "employment_type": null, "consent": null, "loan_purpose": null, "loan_amount": null}}
+{{"name": null, "dob": null, "income": null, "employment_type": null, "consent": null, "loan_purpose": null, "loan_amount": null, "ovd_type": null, "otp": null, "liveness_done": null}}
 
 If a field is not mentioned, use null. Extract ONLY what is clearly stated."""
 
-        entities = {}
-        try:
-            async with httpx.AsyncClient(timeout=8) as client:
-                resp = await client.post(
-                    f"{settings.OLLAMA_BASE_URL}/api/generate",
-                    json={
-                        "model": settings.LLM_MODEL_SMALL,
-                        "prompt": prompt,
-                        "stream": False,
-                        "format": "json",
-                    },
-                )
-                if resp.status_code == 200:
-                    import json
-                    result = resp.json()
-                    entities = json.loads(result.get("response", "{}"))
-                else:
-                    logger.warning(f"Ollama returned error {resp.status_code}: {resp.text}")
-        except Exception as e:
-            logger.warning(f"Entity extraction failed (Ollama connection error): {str(e) or type(e).__name__}")
+        entities = await llm_gateway.generate_structured(
+            model=settings.LLM_MODEL_SMALL,
+            prompt=prompt,
+            required_keys=["name", "consent"],
+            num_predict=80,
+            timeout=8,
+        )
 
         # Keyword-based fallback for Consent (critical for pipeline progress)
         if stage == "GREETING_CONSENT":
@@ -193,28 +173,108 @@ If a field is not mentioned, use null. Extract ONLY what is clearly stated."""
                     logger.info("LLM didn't detect consent, but keyword fallback found it.")
                     entities["consent"] = "yes"
 
+        # Keyword fallback for OVD document type
+        if stage == "OVD_DOCUMENT_CAPTURE":
+            if not entities.get("ovd_type"):
+                text = transcript.lower()
+                if any(w in text for w in ["aadhaar", "aadhar", "adhar", "uid"]):
+                    entities["ovd_type"] = "aadhaar"
+                elif any(w in text for w in ["pan", "pan card", "income tax"]):
+                    entities["ovd_type"] = "pan"
+
+        # Keyword fallback for liveness confirmation
+        if stage == "LIVENESS_CHALLENGE":
+            if not entities.get("liveness_done"):
+                text = transcript.lower()
+                if any(w in text for w in ["done", "okay", "yes", "did it", "blinked", "haan"]):
+                    entities["liveness_done"] = "yes"
+
+        # Keyword fallback for OTP
+        if stage == "AADHAAR_VERIFICATION":
+            if not entities.get("otp"):
+                # Look for 6-digit number in transcript
+                otp_match = re.search(r'\b(\d{6})\b', transcript.replace(" ", ""))
+                if not otp_match:
+                    # Try extracting spoken digits
+                    digits = re.findall(r'\d', transcript)
+                    if len(digits) >= 6:
+                        entities["otp"] = "".join(digits[:6])
+                else:
+                    entities["otp"] = otp_match.group(1)
+
         return entities
 
     def _apply_entities(self, state: SharedState, entities: dict):
-        """Write extracted entities back into the appropriate state fields."""
+        """
+        Write extracted entities back into the appropriate state fields.
+        Includes validation to prevent invalid data from being stored.
+        """
+        # Name validation: must have at least 2 words, no obvious non-names
         if entities.get("name"):
-            state.customer_identity.name = entities["name"]
+            name = str(entities["name"]).strip()
+            words = name.split()
+            # Must have at least 2 words (first + last name)
+            # Must be alphabetic (no numbers)
+            # Must be at least 5 chars total
+            if (
+                len(words) >= 2
+                and len(name) >= 5
+                and all(re.match(r"^[A-Za-z\.'-]+$", w) for w in words)
+            ):
+                state.customer_identity.name = name
+            else:
+                logger.warning(f"Rejected invalid name entity: '{name}'")
+
         if entities.get("dob"):
             state.customer_identity.declared_dob = entities["dob"]
+
         if entities.get("income"):
             try:
-                state.financial_data.monthly_income = float(str(entities["income"]).replace(",", ""))
+                income = float(str(entities["income"]).replace(",", "").replace("₹", ""))
+                if 1_000 <= income <= 10_000_000:  # Sanity check
+                    state.financial_data.monthly_income = income
+                else:
+                    logger.warning(f"Rejected out-of-range income: {income}")
             except (ValueError, TypeError):
                 pass
+
         if entities.get("employment_type"):
-            state.financial_data.employment_type = entities["employment_type"]
+            emp = str(entities["employment_type"]).strip().lower()
+            valid_types = {"salaried", "self-employed", "self employed", "business", "freelance", "professional"}
+            if emp in valid_types:
+                state.financial_data.employment_type = entities["employment_type"]
+
         if entities.get("loan_purpose"):
             state.extracted_signals.loan_purpose = entities["loan_purpose"]
+
         if entities.get("loan_amount"):
             try:
-                state.extracted_signals.loan_amount_requested = float(str(entities["loan_amount"]).replace(",", ""))
+                amount = float(str(entities["loan_amount"]).replace(",", "").replace("₹", ""))
+                if amount > 0:
+                    state.extracted_signals.loan_amount_requested = amount
             except (ValueError, TypeError):
                 pass
+
+        # Consent
         if entities.get("consent") and str(entities["consent"]).lower() in ("yes", "true", "i agree", "agree"):
             state.customer_identity.consent_given = True
             state.customer_identity.consent_timestamp = time.time()
+
+        # OVD document type
+        if entities.get("ovd_type"):
+            ovd = str(entities["ovd_type"]).lower()
+            if ovd in ("aadhaar", "pan", "passport"):
+                state.customer_identity.ovd_type = ovd
+
+        # Liveness challenge completion
+        if entities.get("liveness_done"):
+            if str(entities["liveness_done"]).lower() in ("yes", "true", "done"):
+                state.customer_identity.liveness_challenge_passed = True
+
+        # Aadhaar OTP
+        if entities.get("otp"):
+            otp = str(entities["otp"]).strip()
+            if re.match(r'^\d{6}$', otp):
+                # For MVP: any valid 6-digit OTP is accepted
+                state.customer_identity.aadhaar_otp_verified = True
+                logger.info(f"Aadhaar OTP accepted (mock): {otp[:2]}****")

@@ -44,6 +44,20 @@ async def lifespan(app: FastAPI):
     await rabbitmq_client.start_workers()
     logger.info("✅ Agent workers started")
 
+    # ── Model warmup (eliminates cold-start latency) ─────────────────────
+    try:
+        from services.llm_gateway import llm_gateway
+        await llm_gateway.warmup()
+    except Exception as e:
+        logger.warning(f"LLM warmup failed (non-fatal): {e}")
+
+    try:
+        from services.tts_service import tts_service
+        await tts_service.synthesize("System ready.", "warmup")
+        logger.info("✅ TTS service warmed up")
+    except Exception as e:
+        logger.warning(f"TTS warmup failed (non-fatal): {e}")
+
     yield
 
     # Graceful shutdown

@@ -25,15 +25,18 @@ const BRAND = {
 };
 
 const STAGE_META = {
-  INIT:               { label: "Connecting…",        icon: "⏳", pct: 0  },
-  GREETING_CONSENT:   { label: "Consent",             icon: "🤝", pct: 10 },
-  IDENTITY_KYC:       { label: "Identity Verification", icon: "🪪", pct: 30 },
-  EMPLOYMENT_INCOME:  { label: "Income Details",      icon: "💼", pct: 50 },
-  LOAN_PURPOSE:       { label: "Loan Purpose",        icon: "🎯", pct: 65 },
-  RISK_ASSESSMENT:    { label: "Assessment",          icon: "📊", pct: 80 },
-  OFFER_ACCEPTANCE:   { label: "Your Offer",          icon: "🎁", pct: 95 },
-  COMPLETED:          { label: "Complete!",           icon: "✅", pct: 100 },
-  ESCALATED:          { label: "Human Agent",         icon: "👤", pct: 80 },
+  INIT:                 { label: "Connecting…",          icon: "⏳", pct: 0  },
+  GREETING_CONSENT:     { label: "Consent",               icon: "🤝", pct: 8  },
+  OVD_DOCUMENT_CAPTURE: { label: "Document Capture",      icon: "📄", pct: 18 },
+  LIVENESS_CHALLENGE:   { label: "Liveness Check",        icon: "👁️", pct: 28 },
+  AADHAAR_VERIFICATION: { label: "Aadhaar Verification",  icon: "🔐", pct: 38 },
+  IDENTITY_KYC:         { label: "Identity Verification", icon: "🪪", pct: 48 },
+  EMPLOYMENT_INCOME:    { label: "Income Details",        icon: "💼", pct: 60 },
+  LOAN_PURPOSE:         { label: "Loan Purpose",          icon: "🎯", pct: 72 },
+  RISK_ASSESSMENT:      { label: "Assessment",            icon: "📊", pct: 84 },
+  OFFER_ACCEPTANCE:     { label: "Your Offer",            icon: "🎁", pct: 95 },
+  COMPLETED:            { label: "Complete!",             icon: "✅", pct: 100 },
+  ESCALATED:            { label: "Human Agent",           icon: "👤", pct: 84 },
 };
 
 
@@ -89,7 +92,11 @@ function CallUI({ callId }) {
   const [audioFirst,    setAudioFirst]   = useState(false);
   const [error,         setError]        = useState(null);
   const [agentSpeech,   setAgentSpeech]  = useState("");
-  const [debugSpeech,   setDebugSpeech]  = useState(""); // <-- ADDED DEBUG STATE
+  const [debugSpeech,   setDebugSpeech]  = useState("");
+  // Local mic/cam state tracking (syncs with VideoSDK but prevents stale closures)
+  const [micActive,     setMicActive]    = useState(true);
+  const [camActive,     setCamActive]    = useState(true);
+  const toggleCooldown                   = useRef(false);
   const evtSourceRef                     = useRef(null);
   const audioPlayerRef                   = useRef(null);
   const joinedRef                        = useRef(false);
@@ -403,8 +410,9 @@ function CallUI({ callId }) {
   // ── Canvas snapshot for vision agent ───────────────────────────────────────
   // Captures video frames and sends to backend for face/liveness analysis
   useEffect(() => {
-    if (!joined || stage !== "IDENTITY_KYC") {
-      // Only capture snapshots during KYC stage
+    const SNAPSHOT_STAGES = ["LIVENESS_CHALLENGE", "IDENTITY_KYC"];
+    if (!joined || !SNAPSHOT_STAGES.includes(stage)) {
+      // Only capture snapshots during V-CIP stages that need vision
       if (snapshotIntervalRef.current) {
         clearInterval(snapshotIntervalRef.current);
         snapshotIntervalRef.current = null;
@@ -536,6 +544,11 @@ function CallUI({ callId }) {
             {/* Hidden audio player for TTS */}
             <audio ref={audioPlayerRef} style={{ display: "none" }} />
 
+            {/* Document Upload Overlay */}
+            {stage === "OVD_DOCUMENT_CAPTURE" && (
+              <DocumentUploadOverlay callId={callId} />
+            )}
+
             {/* Offer overlay */}
             {offer && stage === "OFFER_ACCEPTANCE" && (
               <OfferOverlay offer={offer} callId={callId} />
@@ -554,10 +567,22 @@ function CallUI({ callId }) {
       {/* Control bar */}
       {joined && (
         <ControlBar
-          micOn={localMicOn}
-          camOn={localWebcamOn && !audioFirst}
-          onToggleMic={toggleMic}
-          onToggleCam={toggleWebcam}
+          micOn={micActive}
+          camOn={camActive}
+          onToggleMic={() => {
+            if (toggleCooldown.current) return;
+            toggleCooldown.current = true;
+            toggleMic();
+            setMicActive((prev) => !prev);
+            setTimeout(() => { toggleCooldown.current = false; }, 500);
+          }}
+          onToggleCam={() => {
+            if (toggleCooldown.current) return;
+            toggleCooldown.current = true;
+            toggleWebcam();
+            setCamActive((prev) => !prev);
+            setTimeout(() => { toggleCooldown.current = false; }, 500);
+          }}
           onLeave={handleLeave}
           audioFirst={audioFirst}
           stage={stage}
@@ -818,6 +843,8 @@ function LocalAudioVisualizer({ micStream }) {
     </div>
   );
 }
+
+
 
 function OfferOverlay({ offer, callId }) {
   const [selected,  setSelected]  = useState(24);
@@ -1124,6 +1151,16 @@ const styles = {
     boxShadow: `0 0 60px ${BRAND.accent}20`,
     textAlign: "center",
   },
+  documentUploadCard: {
+    position: "absolute",
+    top: "50%", left: "50%", transform: "translate(-50%, -50%)",
+    background: "rgba(17,24,39,0.95)", backdropFilter: "blur(12px)",
+    borderRadius: 20, border: `1px solid ${BRAND.accent}40`,
+    padding: 32, maxWidth: 400, width: "90%",
+    boxShadow: `0 0 40px ${BRAND.accent}20`,
+    textAlign: "center", zIndex: 100,
+    animation: "fadeIn 0.3s ease",
+  },
   offerBadge: {
     display: "inline-block",
     background: `${BRAND.accent}18`, color: BRAND.accent,
@@ -1217,6 +1254,78 @@ const styles = {
     maxWidth: 300, zIndex: 50, fontFamily: "monospace",
   },
 };
+
+
+function DocumentUploadOverlay({ callId }) {
+  const [file, setFile] = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const [success, setSuccess] = useState(false);
+
+  const handleUpload = async () => {
+    if (!file) return;
+    setUploading(true);
+    
+    const formData = new FormData();
+    formData.append("file", file);
+    
+    try {
+      const response = await fetch(`/api/v1/session/${callId}/upload-document`, {
+        method: "POST",
+        body: formData,
+      });
+      if (response.ok) {
+        setSuccess(true);
+      } else {
+        console.error("Document upload failed");
+        setUploading(false);
+      }
+    } catch (err) {
+      console.error("Document upload error", err);
+      setUploading(false);
+    }
+  };
+
+  if (success) {
+    return (
+      <div style={styles.documentUploadCard}>
+        <div style={{ fontSize: 32, marginBottom: 8 }}>✅</div>
+        <h3 style={{ margin: 0, fontSize: 18 }}>Document Uploaded!</h3>
+        <p style={{ fontSize: 13, color: BRAND.textMuted, margin: "8px 0 0" }}>
+          Please wait while we verify your identity...
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div style={styles.documentUploadCard}>
+      <h3 style={{ margin: "0 0 12px 0", fontSize: 18 }}>Upload Identity Document</h3>
+      <p style={{ fontSize: 13, color: BRAND.textMuted, margin: "0 0 16px 0", lineHeight: 1.4 }}>
+        Please upload a clear photo of your original Aadhaar or PAN card to proceed.
+      </p>
+      <input 
+        type="file" 
+        accept="image/*" 
+        onChange={(e) => setFile(e.target.files[0])}
+        style={{ marginBottom: 16, width: "100%", fontSize: 13 }}
+      />
+      <button 
+        style={{
+          ...styles.joinBtn, 
+          padding: "10px 24px", 
+          fontSize: 14, 
+          width: "100%",
+          opacity: (!file || uploading) ? 0.6 : 1,
+          cursor: (!file || uploading) ? "not-allowed" : "pointer"
+        }}
+        onClick={handleUpload}
+        disabled={!file || uploading}
+      >
+        {uploading ? "Uploading..." : "Upload Document"}
+      </button>
+    </div>
+  );
+}
 
 const keyframes = `
   @keyframes pulse {
