@@ -40,57 +40,7 @@ from core.database import db
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# ── SSE heartbeat interval (seconds) ─────────────────────────────────────────
-_SSE_HEARTBEAT_INTERVAL = 15
-
-# ── Startup preload ────────────────────────────────────────────────────────────
-
-async def startup_preload():
-    """
-    Called once at app startup (add to FastAPI lifespan).
-    Eliminates cold-start by eagerly loading LLM + TTS + EventBus handlers.
-    """
-    logger.info("🔄 Preloading models and services...")
-
-    # 1. Import ConversationAgent — registers EventBus handlers at import time
-    try:
-        from agents.conversation_agents import conversation_agent  # noqa: F401
-        logger.info("✅ ConversationAgent EventBus handlers registered")
-    except Exception as e:
-        logger.error(f"ConversationAgent preload failed: {e}")
-
-    # 2. LLM warm-up (non-blocking — failure is non-fatal)
-    try:
-        from services.llm_gateway import llm_gateway
-        await asyncio.wait_for(
-            llm_gateway.generate_text(
-                model=settings.LLM_MODEL_SMALL,
-                prompt="Hello",
-                num_predict=3,
-                timeout=30,
-                force_json=False,
-            ),
-            timeout=35,
-        )
-        logger.info("✅ LLM model warmed up")
-    except asyncio.TimeoutError:
-        logger.warning("⚠️  LLM warmup timed out — model may need more RAM/VRAM")
-    except Exception as e:
-        logger.warning(f"⚠️  LLM warmup failed (non-fatal): {e}")
-
-    # 3. TTS warm-up + static precomputation
-    try:
-        from services.tts_service import tts_service
-        warmed = await tts_service.warm_up()
-        if warmed:
-            await tts_service.precompute_static_cache()
-            logger.info("✅ TTS warm-up + static cache ready")
-        else:
-            logger.warning("⚠️  TTS warm-up failed — first greeting will be synthesised on-demand")
-    except Exception as e:
-        logger.warning(f"⚠️  TTS preload failed (non-fatal): {e}")
-
-    logger.info("✅ Startup preload complete — ready for calls")
+_SSE_HEARTBEAT_INTERVAL = 15  # seconds
 
 
 async def _precompute_session_tts(call_id: str):
@@ -320,6 +270,7 @@ async def join_session(session_token: str, request: Request):
             and not state.customer_identity.consent_given
             and await redis_client.set_once(regreet_guard, "1", ttl_seconds=5)
         ):
+            # pyrefly: ignore [missing-import]
             from agents.conversation_agents import conversation_agent
 
             async def _delayed_regreet():
@@ -331,13 +282,24 @@ async def join_session(session_token: str, request: Request):
             asyncio.create_task(_delayed_regreet())
             logger.info(f"Reconnect: will resend greeting in 1.5 s [{call_id}]")
 
-    logger.info(f"Customer joined: {call_id} | participant: {participant_id}")
+    # Return the ACTUAL current stage so the frontend initialises correctly
+    # on both fresh joins and reconnects mid-session.
+    current_stage_val = SessionStage.GREETING_CONSENT.value
+    if state_raw:
+        try:
+            current_stage_val = SharedState.from_json(
+                await redis_client.get_state(f"session:{call_id}:state")
+            ).current_stage.value
+        except Exception:
+            pass
+
+    logger.info(f"Customer joined: {call_id} | participant: {participant_id} | stage: {current_stage_val}")
     return JoinSessionResponse(
         call_id=call_id,
         videosdk_room_id=room_id,
         videosdk_token=token,
         participant_id=participant_id,
-        stage=SessionStage.GREETING_CONSENT.value,
+        stage=current_stage_val,
     )
 
 
@@ -429,6 +391,7 @@ async def receive_transcript(call_id: str, payload: TranscriptPayload):
         "ts":      time.time(),
     })
 
+    # pyrefly: ignore [missing-import]
     from agents.stt_pipeline import stt_pipeline
     asyncio.create_task(
         stt_pipeline.process_utterance(call_id, payload.text, payload.timestamp)
@@ -452,7 +415,12 @@ async def upload_document(
 
     session_dir = DOCUMENTS_DIR / call_id
     session_dir.mkdir(parents=True, exist_ok=True)
-    safe_filename = f"{int(time.time())}_{file.filename}"
+    # Sanitise filename: strip path separators, keep only safe extension
+    raw_name      = (file.filename or "upload").replace("/", "_").replace("\\", "_")
+    ext           = Path(raw_name).suffix.lower() if "." in raw_name else ".jpg"
+    if ext not in (".jpg", ".jpeg", ".png", ".pdf", ".webp"):
+        ext = ".jpg"
+    safe_filename = f"doc_{call_id[:8]}_{int(time.time())}{ext}"
     filepath      = session_dir / safe_filename
 
     content = await file.read()

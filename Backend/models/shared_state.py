@@ -3,11 +3,11 @@ Shared State – typed, versioned session data object.
 All agents read from and write to this via Redis.
 
 Refactor notes:
-  - Removed LIVENESS_CHALLENGE stage (merged into OVD_DOCUMENT_CAPTURE)
+  - Removed LIVENESS_CHALLENGE and AADHAAR_VERIFICATION stages
   - Added doc_authenticity_passed + doc_authenticity_score to CustomerIdentity
-  - Stage order: GREETING_CONSENT → OVD_DOCUMENT_CAPTURE → AADHAAR_VERIFICATION
-                 → IDENTITY_KYC → EMPLOYMENT_INCOME → LOAN_PURPOSE
-                 → RISK_ASSESSMENT → OFFER_ACCEPTANCE → COMPLETED
+  - Stage order: GREETING_CONSENT → OVD_DOCUMENT_CAPTURE → IDENTITY_KYC
+                 → EMPLOYMENT_INCOME → LOAN_PURPOSE → RISK_ASSESSMENT
+                 → OFFER_ACCEPTANCE → COMPLETED
 """
 from __future__ import annotations
 

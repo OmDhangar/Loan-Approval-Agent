@@ -1,16 +1,13 @@
 """
 main.py – FastAPI app entry point
 
-FIXES APPLIED:
-  FIX-1  tts_service.warm_up() and tts_service.precompute_static_cache()
-         are now explicitly awaited inside the lifespan startup block,
-         BEFORE the first session can be created.
-         The order matters:
-           1. Redis connect  (cache reads/writes need this first)
-           2. DB connect
-           3. TTS warm_up    (opens the edge-tts HTTP connection)
-           4. TTS precompute (synthesises + populates Redis + local FS)
-           5. RabbitMQ / workers (if still used for heavy tasks)
+Startup order:
+  1. Redis connect  (cache reads/writes need this first)
+  2. DB connect
+  3. TTS warm_up    (opens the edge-tts HTTP connection)
+  4. TTS precompute (synthesises + populates Redis + local FS)
+  5. LLM warmup     (pre-loads model into Ollama VRAM)
+  6. ConversationAgent EventBus handler registration
 """
 
 import asyncio
@@ -59,11 +56,18 @@ async def lifespan(app: FastAPI):
             "The greeting will synthesise on-demand for the first session."
         )
 
-    # 2. Warm up LLM gateway (send a tiny prompt to force model load)
-    # DISABLED: LLM requires 5.2 GiB but only 2.2 GiB available
-    # The system will work without LLM for the greeting stage
-    logger.info("⚠️  LLM warmup skipped (insufficient system memory - requires 5.2 GiB, have 2.2 GiB)")
-    logger.info("ℹ️  System will work without LLM for greeting stage")
+    # ── 3. LLM warm-up (non-fatal) ────────────────────────────────────────────
+    try:
+        from services.llm_gateway import llm_gateway
+        warmed_llm = await asyncio.wait_for(llm_gateway.warmup(), timeout=60)
+        if warmed_llm:
+            logger.info("✅ LLM model warmed up")
+        else:
+            logger.warning("⚠️  LLM warmup returned False — STT will use keyword fallback")
+    except asyncio.TimeoutError:
+        logger.warning("⚠️  LLM warmup timed out (60s) — STT will use keyword fallback")
+    except Exception as e:
+        logger.warning(f"⚠️  LLM warmup failed (non-fatal): {e}")
 
     logger.info("🎯 Loan Wizard is ready to accept sessions")
 
@@ -80,11 +84,6 @@ async def lifespan(app: FastAPI):
 
     # ── Graceful shutdown ────────────────────────────────────────────────────
     logger.info("🛑 Shutting down…")
-    try:
-        from core.rabbitmq_client import rabbitmq_client
-        await rabbitmq_client.close()
-    except Exception:
-        pass
     try:
         from services.llm_gateway import llm_gateway
         await llm_gateway.close()
@@ -115,6 +114,10 @@ app.include_router(session.router,  prefix="/api/v1/session",  tags=["Session"])
 app.include_router(videosdk.router, prefix="/api/v1/videosdk", tags=["VideoSDK"])
 app.include_router(agents.router,   prefix="/api/v1/agents",   tags=["Agents"])
 app.include_router(webhook.router,  prefix="/api/v1/webhook",  tags=["Webhook"])
+
+# Mock credit bureau API (serves deterministic test personas for development)
+from mock_bureau.router import router as bureau_router
+app.include_router(bureau_router, prefix="/api/v1/bureau", tags=["Bureau"])
 
 
 # ── TTS audio file serving route ──────────────────────────────────────────────

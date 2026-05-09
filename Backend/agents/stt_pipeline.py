@@ -112,7 +112,6 @@ class STTPipeline:
         stage_hints = {
             "GREETING_CONSENT":      "Look for: consent phrases like 'I agree', 'yes I consent', 'haan'",
             "OVD_DOCUMENT_CAPTURE":  "Look for: document type (aadhaar, PAN), any document number",
-            "AADHAAR_VERIFICATION":  "Look for: a 6-digit OTP number",
             "IDENTITY_KYC":          "Look for: full name (first + last), date of birth (DD/MM/YYYY)",
             "EMPLOYMENT_INCOME":     "Look for: employment type (salaried/self-employed), monthly income in rupees",
             "LOAN_PURPOSE":          "Look for: loan purpose, amount needed, repayment period in months",
@@ -126,7 +125,7 @@ Hint: {hint}
 Transcript: "{transcript}"
 
 Respond ONLY with valid JSON. Example:
-{{"name": null, "dob": null, "income": null, "employment_type": null, "consent": null, "loan_purpose": null, "loan_amount": null, "ovd_type": null, "otp": null}}
+{{"name": null, "dob": null, "income": null, "employment_type": null, "consent": null, "loan_purpose": null, "loan_amount": null, "ovd_type": null}}
 
 If a field is not mentioned, use null. Extract ONLY what is clearly stated."""
 
@@ -137,6 +136,11 @@ If a field is not mentioned, use null. Extract ONLY what is clearly stated."""
             num_predict=80,
             timeout=6,   # Shorter timeout for real-time feel
         )
+
+        # If LLM returned nothing (timeout/unavailable), use keyword-only extraction
+        if not entities:
+            logger.info(f"LLM unavailable for STT — using keyword-only extraction (stage={stage})")
+            entities = self._keyword_extract(transcript, stage)
 
         # ── Keyword fallbacks for critical fields ──────────────────────────
 
@@ -157,16 +161,7 @@ If a field is not mentioned, use null. Extract ONLY what is clearly stated."""
                 elif any(w in text for w in ["pan", "pan card", "income tax"]):
                     entities["ovd_type"] = "pan"
 
-        # OTP — 6-digit number
-        if stage == "AADHAAR_VERIFICATION":
-            if not entities.get("otp"):
-                otp_match = re.search(r'\b(\d{6})\b', transcript.replace(" ", ""))
-                if otp_match:
-                    entities["otp"] = otp_match.group(1)
-                else:
-                    digits = re.findall(r'\d', transcript)
-                    if len(digits) >= 6:
-                        entities["otp"] = "".join(digits[:6])
+
 
         # Offer acceptance
         if stage == "OFFER_ACCEPTANCE":
@@ -240,13 +235,6 @@ If a field is not mentioned, use null. Extract ONLY what is clearly stated."""
             if ovd in ("aadhaar", "pan", "passport"):
                 state.customer_identity.ovd_type = ovd
 
-        # Aadhaar OTP — MVP: any valid 6-digit OTP accepted
-        if entities.get("otp"):
-            otp = str(entities["otp"]).strip()
-            if re.match(r'^\d{6}$', otp):
-                state.customer_identity.aadhaar_otp_verified = True
-                logger.info(f"Aadhaar OTP accepted (mock): {otp[:2]}****")
-
         # Offer acceptance
         if str(entities.get("accepted", "") or "").lower() == "yes":
             if state.final_offer.eligible_amount:
@@ -254,6 +242,86 @@ If a field is not mentioned, use null. Extract ONLY what is clearly stated."""
         elif str(entities.get("accepted", "") or "").lower() == "no":
             if state.final_offer.eligible_amount:
                 state.final_offer.acceptance_status = "DECLINED"
+
+    # ── Keyword-only extraction fallback ─────────────────────────────────────
+
+    def _keyword_extract(self, transcript: str, stage: str) -> dict:
+        """
+        Pure keyword/regex extraction when LLM is unavailable.
+        Covers the critical fields needed to advance each stage.
+        """
+        text = transcript.lower().strip()
+        entities = {}
+
+        # Consent
+        if stage == "GREETING_CONSENT":
+            if any(w in text for w in ["agree", "consent", "yes", "i do", "haan", "thik hai", "ok", "okay"]):
+                entities["consent"] = "yes"
+
+        # OVD type
+        if stage == "OVD_DOCUMENT_CAPTURE":
+            if any(w in text for w in ["aadhaar", "aadhar", "adhar", "uid"]):
+                entities["ovd_type"] = "aadhaar"
+            elif any(w in text for w in ["pan", "pan card", "income tax"]):
+                entities["ovd_type"] = "pan"
+
+        # Name (simple: 2+ capitalized words)
+        if stage == "IDENTITY_KYC":
+            words = transcript.strip().split()
+            name_words = [w for w in words if w[0:1].isupper() and len(w) >= 2 and w.isalpha()]
+            if len(name_words) >= 2:
+                entities["name"] = " ".join(name_words[:3])
+            # DOB pattern
+            dob_match = re.search(r'(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})', transcript)
+            if dob_match:
+                entities["dob"] = dob_match.group(0)
+
+        # Income
+        if stage == "EMPLOYMENT_INCOME":
+            income_match = re.search(r'(\d[\d,]*)', transcript.replace(' ', ''))
+            if income_match:
+                try:
+                    val = float(income_match.group(1).replace(',', ''))
+                    if 1_000 <= val <= 10_000_000:
+                        entities["income"] = val
+                except ValueError:
+                    pass
+            if any(w in text for w in ["salaried", "salary"]):
+                entities["employment_type"] = "salaried"
+            elif any(w in text for w in ["self-employed", "self employed", "business", "freelance"]):
+                entities["employment_type"] = "self-employed"
+
+        # Loan purpose
+        if stage == "LOAN_PURPOSE":
+            purposes = {
+                "home": "home_renovation", "renovation": "home_renovation",
+                "education": "education", "study": "education",
+                "medical": "medical", "health": "medical", "hospital": "medical",
+                "business": "business", "wedding": "wedding", "marriage": "wedding",
+                "car": "vehicle", "vehicle": "vehicle", "bike": "vehicle",
+                "personal": "personal", "travel": "travel",
+            }
+            for keyword, purpose in purposes.items():
+                if keyword in text:
+                    entities["loan_purpose"] = purpose
+                    break
+            amount_match = re.search(r'(\d[\d,]*)', transcript.replace(' ', ''))
+            if amount_match:
+                try:
+                    val = float(amount_match.group(1).replace(',', ''))
+                    if val > 0:
+                        entities["loan_amount"] = val
+                except ValueError:
+                    pass
+
+        # Offer acceptance
+        if stage == "OFFER_ACCEPTANCE":
+            if any(w in text for w in ["accept", "yes", "agree", "proceed", "haan", "theek"]):
+                entities["accepted"] = "yes"
+            elif any(w in text for w in ["reject", "no", "decline", "nahi", "nope"]):
+                entities["accepted"] = "no"
+
+        return entities
 
 
 # ── Singleton ─────────────────────────────────────────────────────────────────

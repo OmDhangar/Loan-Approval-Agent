@@ -1,13 +1,8 @@
 """
 EventBus – In-Process Async Event Router
 ─────────────────────────────────────────
-Replaces RabbitMQ for all real-time conversational paths.
+Primary event bus for all real-time agent communication.
 Agents subscribe to named events and react to state changes.
-
-RabbitMQ is still used ONLY for:
-  - Heavy async background work (bureau fetch is already async via httpx)
-  - Human escalation notifications
-  - Audit log writes to PostgreSQL
 
 Event contract:
   Every event payload MUST contain: call_id, event (name), ts (unix float)
@@ -97,7 +92,6 @@ class Events:
     CONSENT_CAPTURED        = "CONSENT_CAPTURED"
     DOCUMENT_UPLOADED       = "DOCUMENT_UPLOADED"
     DOCUMENT_VERIFIED       = "DOCUMENT_VERIFIED"
-    AADHAAR_OTP_VERIFIED    = "AADHAAR_OTP_VERIFIED"
     IDENTITY_VERIFIED       = "IDENTITY_VERIFIED"
     INCOME_CAPTURED         = "INCOME_CAPTURED"
     LOAN_PURPOSE_CAPTURED   = "LOAN_PURPOSE_CAPTURED"

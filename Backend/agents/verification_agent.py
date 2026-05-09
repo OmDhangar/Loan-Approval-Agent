@@ -136,7 +136,7 @@ class VerificationAgent:
             f"ovd_type={ovd_type}, issues={issues}"
         )
 
-        # Report to orchestrator — advance to Aadhaar OTP stage
+        # Report to orchestrator — advance to next stage (Identity KYC)
         await moderator_engine.advance_stage(call_id, {
             "passed":     passed,
             "escalate":   score < 0.3,   # Hard fail → escalate

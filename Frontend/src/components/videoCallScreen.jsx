@@ -14,29 +14,27 @@ import {
 
 // ── Design tokens ─────────────────────────────────────────────────────────────
 const BRAND = {
-  primary:    "#3b82f6",   // Electric Blue
-  accent:     "#60a5fa",   // Cyan
-  danger:     "#ef4444",
-  surface:    "rgba(255, 255, 255, 0.03)",
+  primary: "#3b82f6",   // Electric Blue
+  accent: "#60a5fa",   // Cyan
+  danger: "#ef4444",
+  surface: "rgba(255, 255, 255, 0.03)",
   surfaceAlt: "rgba(255, 255, 255, 0.05)",
-  border:     "rgba(255, 255, 255, 0.1)",
-  text:       "#f8fafc",
-  textMuted:  "#94a3b8",
+  border: "rgba(255, 255, 255, 0.1)",
+  text: "#f8fafc",
+  textMuted: "#94a3b8",
 };
 
 const STAGE_META = {
-  INIT:                 { label: "Initializing…",        icon: "⚡", pct: 0  },
-  GREETING_CONSENT:     { label: "Consent & Greeting",    icon: "🤝", pct: 8  },
-  OVD_DOCUMENT_CAPTURE: { label: "Document Verification", icon: "📄", pct: 18 },
-  LIVENESS_CHALLENGE:   { label: "Biometric Liveness",    icon: "👁️", pct: 28 },
-  AADHAAR_VERIFICATION: { label: "Digital Aadhaar",       icon: "🔐", pct: 38 },
-  IDENTITY_KYC:         { label: "Identity Match",        icon: "🪪", pct: 48 },
-  EMPLOYMENT_INCOME:    { label: "Financial Data",        icon: "💼", pct: 60 },
-  LOAN_PURPOSE:         { label: "Loan Objective",        icon: "🎯", pct: 72 },
-  RISK_ASSESSMENT:      { label: "AI Underwriting",       icon: "📊", pct: 84 },
-  OFFER_ACCEPTANCE:     { label: "Loan Offer",            icon: "🎁", pct: 95 },
-  COMPLETED:            { label: "Approved!",             icon: "✅", pct: 100 },
-  ESCALATED:            { label: "Human Officer",         icon: "👤", pct: 84 },
+  INIT: { label: "Initializing…", icon: "⚡", pct: 0 },
+  GREETING_CONSENT: { label: "Consent & Greeting", icon: "🤝", pct: 10 },
+  OVD_DOCUMENT_CAPTURE: { label: "Document Verification", icon: "📄", pct: 25 },
+  IDENTITY_KYC: { label: "Identity Match", icon: "🪪", pct: 40 },
+  EMPLOYMENT_INCOME: { label: "Financial Data", icon: "💼", pct: 55 },
+  LOAN_PURPOSE: { label: "Loan Objective", icon: "🎯", pct: 70 },
+  RISK_ASSESSMENT: { label: "AI Underwriting", icon: "📊", pct: 85 },
+  OFFER_ACCEPTANCE: { label: "Loan Offer", icon: "🎁", pct: 95 },
+  COMPLETED: { label: "Approved!", icon: "✅", pct: 100 },
+  ESCALATED: { label: "Human Officer", icon: "👤", pct: 85 },
 };
 
 
@@ -44,22 +42,22 @@ const STAGE_META = {
 // ══════════════════════════════════════════════════════════════════════════════
 // Root: wraps MeetingProvider from VideoSDK
 // ══════════════════════════════════════════════════════════════════════════════
-export default function VideoCallScreen({ callId, roomId, videoSdkToken }) {
+export default function VideoCallScreen({ callId, roomId, videoSdkToken, initialStage }) {
   return (
     <MeetingProvider
       config={{
-        meetingId:     roomId,
-        micEnabled:    true,
+        meetingId: roomId,
+        micEnabled: true,
         webcamEnabled: true,
-        name:          "Loan Applicant",
-        multiStream:   false,           // single high-quality stream
-        mode:          "CONFERENCE",
+        name: "Loan Applicant",
+        multiStream: false,           // single high-quality stream
+        mode: "CONFERENCE",
       }}
       token={videoSdkToken}
       joinWithoutUserInteraction={false}
     >
       <MeetingConsumer>
-        {() => <CallUI callId={callId} />}
+        {() => <CallUI callId={callId} initialStage={initialStage} />}
       </MeetingConsumer>
     </MeetingProvider>
   );
@@ -69,7 +67,7 @@ export default function VideoCallScreen({ callId, roomId, videoSdkToken }) {
 // ══════════════════════════════════════════════════════════════════════════════
 // Inner UI — has access to VideoSDK meeting hooks
 // ══════════════════════════════════════════════════════════════════════════════
-function CallUI({ callId }) {
+function CallUI({ callId, initialStage }) {
   const {
     join, leave,
     toggleMic, toggleWebcam,
@@ -78,44 +76,45 @@ function CallUI({ callId }) {
     localParticipant,
     meetingId,
   } = useMeeting({
-    onMeetingJoined:  () => console.log("Meeting joined"),
-    onMeetingLeft:    () => {
+    onMeetingJoined: () => console.log("Meeting joined"),
+    onMeetingLeft: () => {
       console.log("Meeting left");
       setJoined(false);
     },
-    onError:          (err) => console.error("Meeting error:", err),
+    onError: (err) => console.error("Meeting error:", err),
   });
 
   // ── Local state ───────────────────────────────────────────────────────────
-  const [joined,        setJoined]       = useState(false);
-  const [stage,         setStage]        = useState("INIT");
-  const [caption,       setCaption]      = useState("");
-  const [offer,         setOffer]        = useState(null);
-  const [escalated,     setEscalated]    = useState(false);
-  const [networkScore,  setNetworkScore] = useState(5);
-  const [audioFirst,    setAudioFirst]   = useState(false);
-  const [error,         setError]        = useState(null);
+  const [joined, setJoined] = useState(false);
+  // Seed from the join-response stage so reconnects don't reset to INIT
+  const [stage, setStage] = useState(initialStage || "INIT");
+  const [caption, setCaption] = useState("");
+  const [offer, setOffer] = useState(null);
+  const [escalated, setEscalated] = useState(false);
+  const [networkScore, setNetworkScore] = useState(5);
+  const [audioFirst, setAudioFirst] = useState(false);
+  const [error, setError] = useState(null);
   const [audioUnlocked, setAudioUnlocked] = useState(false);
-  const [agentSpeech,   setAgentSpeech]  = useState("");
-  const [debugSpeech,   setDebugSpeech]  = useState("");
+  const [agentSpeech, setAgentSpeech] = useState("");
+  const [debugSpeech, setDebugSpeech] = useState("");
   // Local mic/cam state tracking (syncs with VideoSDK but prevents stale closures)
-  const [micActive,     setMicActive]    = useState(true);
-  const [camActive,     setCamActive]    = useState(true);
-  const [audioEnabled,  setAudioEnabled] = useState(false);
-  const toggleCooldown                   = useRef(false);
-  const evtSourceRef                     = useRef(null);
-  const audioPlayerRef                   = useRef(null);
-  const joinedRef                        = useRef(false);
-  const endSentRef                       = useRef(false);
+  const [micActive, setMicActive] = useState(true);
+  const [camActive, setCamActive] = useState(true);
+  const [audioEnabled, setAudioEnabled] = useState(false);
+  const toggleCooldown = useRef(false);
+  const evtSourceRef = useRef(null);
+  const audioPlayerRef = useRef(null);
+  const joinedRef = useRef(false);
+  const endSentRef = useRef(false);
   // Client-side recording refs (replaces VideoSDK cloud recording)
-  const mediaRecorderRef                 = useRef(null);
-  const recordedChunksRef                = useRef([]);
+  const mediaRecorderRef = useRef(null);
+  const recordedChunksRef = useRef([]);
   // Canvas snapshot refs (for vision agent)
-  const snapshotIntervalRef              = useRef(null);
-  const localVideoRef                    = useRef(null);
+  const snapshotIntervalRef = useRef(null);
+  const localVideoRef = useRef(null);
   // Speech recognition refs (replaces paid VideoSDK transcription)
-  const recognitionRef                   = useRef(null);
-  const recordingStreamRef               = useRef(null);
+  const recognitionRef = useRef(null);
+  const recordingStreamRef = useRef(null);
   const localParticipantId = localParticipant?.id;
   const { webcamStream, micStream } = useParticipant(localParticipantId);
 
@@ -178,12 +177,22 @@ function CallUI({ callId }) {
             console.warn("[AUDIO] TTS_AUDIO_READY missing audio_url", evt);
           }
           break;
+        case "LIVE_CAPTION":
+          // Immediate caption published before STT pipeline processing
+          setCaption(evt.text);
+          setTimeout(() => setCaption(""), 5000);
+          break;
         case "STT_UTTERANCE":
           setCaption(evt.transcript);
           setTimeout(() => setCaption(""), 5000);
           break;
+        case "STAGE_ENTERED":
+          // Primary mechanism for stage transitions fired by the moderator engine
+          if (evt.stage) setStage(evt.stage);
+          break;
         case "OFFER_READY":
           setOffer(evt.offer);
+          setStage("OFFER_ACCEPTANCE");  // Advance UI stage — moderator fires STAGE_ENTERED too but belt-and-suspenders
           break;
         case "HUMAN_ESCALATION":
           setEscalated(true);
@@ -197,6 +206,7 @@ function CallUI({ callId }) {
           setStage("COMPLETED");
           break;
         default:
+          // Catch-all: any event with a stage field updates the UI stage
           if (evt.stage) setStage(evt.stage);
       }
     };
@@ -208,38 +218,40 @@ function CallUI({ callId }) {
     joinedRef.current = joined;
   }, [joined]);
 
+  const audioCtxRef = useRef(null);
+
   // ── Audio event listeners for debugging (Task 3) ────────────────────────
   useEffect(() => {
     const audio = audioPlayerRef.current;
     if (!audio) return;
 
-    const onPlay      = () => console.log("[AUDIO EVENT] ▶ PLAY");
-    const onPause     = () => console.log("[AUDIO EVENT] ⏸ PAUSE");
-    const onEnded     = () => console.log("[AUDIO EVENT] ⏹ ENDED");
-    const onError     = (e) => console.error("[AUDIO EVENT] ❌ ERROR", e);
-    const onCanPlay   = () => console.log("[AUDIO EVENT] ✅ CAN_PLAY  readyState:", audio.readyState);
-    const onLoadData  = () => console.log("[AUDIO EVENT] 📦 LOADED_DATA  duration:", audio.duration);
-    const onWaiting   = () => console.log("[AUDIO EVENT] ⏳ WAITING");
-    const onStalled   = () => console.log("[AUDIO EVENT] ⚠️ STALLED");
+    const onPlay = () => console.log("[AUDIO EVENT] ▶ PLAY");
+    const onPause = () => console.log("[AUDIO EVENT] ⏸ PAUSE");
+    const onEnded = () => console.log("[AUDIO EVENT] ⏹ ENDED");
+    const onError = (e) => console.error("[AUDIO EVENT] ❌ ERROR", e);
+    const onCanPlay = () => console.log("[AUDIO EVENT] ✅ CAN_PLAY  readyState:", audio.readyState);
+    const onLoadData = () => console.log("[AUDIO EVENT] 📦 LOADED_DATA  duration:", audio.duration);
+    const onWaiting = () => console.log("[AUDIO EVENT] ⏳ WAITING");
+    const onStalled = () => console.log("[AUDIO EVENT] ⚠️ STALLED");
 
-    audio.addEventListener("play",       onPlay);
-    audio.addEventListener("pause",      onPause);
-    audio.addEventListener("ended",      onEnded);
-    audio.addEventListener("error",      onError);
-    audio.addEventListener("canplay",    onCanPlay);
+    audio.addEventListener("play", onPlay);
+    audio.addEventListener("pause", onPause);
+    audio.addEventListener("ended", onEnded);
+    audio.addEventListener("error", onError);
+    audio.addEventListener("canplay", onCanPlay);
     audio.addEventListener("loadeddata", onLoadData);
-    audio.addEventListener("waiting",    onWaiting);
-    audio.addEventListener("stalled",    onStalled);
+    audio.addEventListener("waiting", onWaiting);
+    audio.addEventListener("stalled", onStalled);
 
     return () => {
-      audio.removeEventListener("play",       onPlay);
-      audio.removeEventListener("pause",      onPause);
-      audio.removeEventListener("ended",      onEnded);
-      audio.removeEventListener("error",      onError);
-      audio.removeEventListener("canplay",    onCanPlay);
+      audio.removeEventListener("play", onPlay);
+      audio.removeEventListener("pause", onPause);
+      audio.removeEventListener("ended", onEnded);
+      audio.removeEventListener("error", onError);
+      audio.removeEventListener("canplay", onCanPlay);
       audio.removeEventListener("loadeddata", onLoadData);
-      audio.removeEventListener("waiting",    onWaiting);
-      audio.removeEventListener("stalled",    onStalled);
+      audio.removeEventListener("waiting", onWaiting);
+      audio.removeEventListener("stalled", onStalled);
     };
   }, []);
 
@@ -287,7 +299,7 @@ function CallUI({ callId }) {
       if (!joinedRef.current || endSentRef.current) return;
       endSentRef.current = true;
       if (!navigator.sendBeacon?.(`/api/v1/session/${callId}/end`)) {
-        fetch(`/api/v1/session/${callId}/end`, { method: "POST", keepalive: true }).catch(() => {});
+        fetch(`/api/v1/session/${callId}/end`, { method: "POST", keepalive: true }).catch(() => { });
       }
     };
 
@@ -310,28 +322,27 @@ function CallUI({ callId }) {
     }
 
     // ── Task 4: Unlock audio context via user gesture ─────────────────────
-    // Use Web Audio API to play a silent buffer — no file source needed.
-    // This unlocks the browser's audio context within the click call stack.
+    // Reuse a single AudioContext for the entire session lifetime (browsers
+    // warn when more than ~6 are created and silently discard extras).
     try {
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
-      const ctx = new AudioCtx();
-      const buffer = ctx.createBuffer(1, 1, 22050); // 1 channel, 1 sample, 22050Hz
+      if (!audioCtxRef.current) {
+        audioCtxRef.current = new AudioCtx();
+      }
+      const ctx = audioCtxRef.current;
+      const buffer = ctx.createBuffer(1, 1, 22050);
       const source = ctx.createBufferSource();
       source.buffer = buffer;
       source.connect(ctx.destination);
       source.start(0);
-
-      // Also resume if suspended (Chrome often starts AudioContext suspended)
       if (ctx.state === "suspended") {
         await ctx.resume();
       }
-
       setAudioUnlocked(true);
       setAudioEnabled(true);
       console.log("[AUDIO] ✅ Audio context unlocked via Web Audio API (state:", ctx.state, ")");
     } catch (err) {
       console.warn("[AUDIO] ⚠️ Audio unlock failed (will retry on first TTS):", err.message);
-      // Still proceed — playAudio() will attempt play() anyway
       setAudioEnabled(true);
     }
 
@@ -359,7 +370,7 @@ function CallUI({ callId }) {
 
     recognition.onresult = async (event) => {
       let interimTranscript = "";
-      
+
       // Get the latest final result and build interim text
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const transcript = event.results[i][0].transcript;
@@ -389,7 +400,7 @@ function CallUI({ callId }) {
           interimTranscript += transcript;
         }
       }
-      
+
       // Update debug layer with real-time interim speech
       if (interimTranscript.trim().length > 0) {
         setDebugSpeech(`[LISTENING...] ${interimTranscript}`);
@@ -535,7 +546,7 @@ function CallUI({ callId }) {
   // ── Canvas snapshot for vision agent ───────────────────────────────────────
   // Captures video frames and sends to backend for face/liveness analysis
   useEffect(() => {
-    const SNAPSHOT_STAGES = ["LIVENESS_CHALLENGE", "IDENTITY_KYC"];
+    const SNAPSHOT_STAGES = ["OVD_DOCUMENT_CAPTURE", "IDENTITY_KYC"];
     if (!joined || !SNAPSHOT_STAGES.includes(stage)) {
       // Only capture snapshots during V-CIP stages that need vision
       if (snapshotIntervalRef.current) {
@@ -585,20 +596,20 @@ function CallUI({ callId }) {
 
   const handleLeave = useCallback(async () => {
     console.log("End call initiated...");
-    
+
     // 1. Stop recording (this starts the background upload, do NOT await)
     stopAndUploadRecording();
-    
+
     // 2. Notify backend that session is ending (non-blocking, uses keepalive)
     notifySessionEnd();
-    
+
     // 3. Leave the VideoSDK meeting immediately
     try {
       leave();
     } catch (e) {
       console.warn("Error during VideoSDK leave:", e);
     }
-    
+
     console.log("Call ended locally.");
   }, [leave, notifySessionEnd, stopAndUploadRecording]);
 
@@ -637,7 +648,10 @@ function CallUI({ callId }) {
           onClick={async () => {
             try {
               const AudioCtx = window.AudioContext || window.webkitAudioContext;
-              const ctx = new AudioCtx();
+              if (!audioCtxRef.current) {
+                audioCtxRef.current = new AudioCtx();
+              }
+              const ctx = audioCtxRef.current;
               const buffer = ctx.createBuffer(1, 1, 22050);
               const source = ctx.createBufferSource();
               source.buffer = buffer;
@@ -805,12 +819,12 @@ function LocalView({ participantId, audioFirst, videoRef: externalVideoRef }) {
 
   return (
     <div style={styles.videoCard}>
-      <video 
-        ref={vidRef} 
-        autoPlay 
-        muted 
-        playsInline 
-        style={{ ...styles.video, display: showVideo ? "block" : "none" }} 
+      <video
+        ref={vidRef}
+        autoPlay
+        muted
+        playsInline
+        style={{ ...styles.video, display: showVideo ? "block" : "none" }}
       />
       {!showVideo && (
         <div style={styles.videoOff}>
@@ -958,7 +972,7 @@ function CaptionBubble({ text }) {
 }
 
 function NetworkIndicator({ score, audioFirst }) {
-  const bars  = [1, 2, 3, 4, 5];
+  const bars = [1, 2, 3, 4, 5];
   const color = score >= 4 ? BRAND.accent : score >= 2 ? "#FBBF24" : BRAND.danger;
   return (
     <div style={styles.netIndicator}>
@@ -1048,9 +1062,9 @@ function LocalAudioVisualizer({ micStream }) {
 
 
 function OfferOverlay({ offer, callId }) {
-  const [selected,  setSelected]  = useState(24);
+  const [selected, setSelected] = useState(24);
   const [accepting, setAccepting] = useState(false);
-  const [accepted,  setAccepted]  = useState(false);
+  const [accepted, setAccepted] = useState(false);
 
   const emiKey = `emi_${selected}m`;
 
@@ -1154,9 +1168,9 @@ function CtrlBtn({ icon, label, onClick, danger, active, disabled }) {
     <button
       style={{
         ...styles.ctrlBtn,
-        ...(danger    ? styles.ctrlBtnDanger   : {}),
-        ...(active    ? {}                      : styles.ctrlBtnInactive),
-        ...(disabled  ? styles.ctrlBtnDisabled : {}),
+        ...(danger ? styles.ctrlBtnDanger : {}),
+        ...(active ? {} : styles.ctrlBtnInactive),
+        ...(disabled ? styles.ctrlBtnDisabled : {}),
       }}
       onClick={onClick}
       disabled={disabled}
@@ -1485,10 +1499,10 @@ function DocumentUploadOverlay({ callId }) {
   const handleUpload = async () => {
     if (!file) return;
     setUploading(true);
-    
+
     const formData = new FormData();
     formData.append("file", file);
-    
+
     try {
       const response = await fetch(`/api/v1/session/${callId}/upload-document`, {
         method: "POST",
@@ -1525,11 +1539,11 @@ function DocumentUploadOverlay({ callId }) {
       <p style={{ fontSize: 15, color: "var(--text-secondary)", margin: "0 0 24px 0", lineHeight: 1.6 }}>
         Please upload a high-quality photo of your original Aadhaar or PAN card.
       </p>
-      
+
       <div className="file-input-wrapper">
-        <input 
-          type="file" 
-          accept="image/*" 
+        <input
+          type="file"
+          accept="image/*"
           id="doc-upload"
           onChange={(e) => setFile(e.target.files[0])}
           style={{ display: "none" }}
@@ -1539,7 +1553,7 @@ function DocumentUploadOverlay({ callId }) {
         </label>
       </div>
 
-      <button 
+      <button
         className="btn-primary"
         style={{
           width: "100%",
@@ -1551,7 +1565,7 @@ function DocumentUploadOverlay({ callId }) {
       >
         {uploading ? "Analyzing..." : "Confirm & Upload"}
       </button>
-      
+
       <style jsx="true">{`
         .file-input-wrapper label {
           padding: 12px;
@@ -1579,4 +1593,3 @@ if (typeof document !== "undefined") {
   style.innerHTML = keyframes;
   document.head.appendChild(style);
 }
-
