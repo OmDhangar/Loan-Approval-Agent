@@ -36,7 +36,6 @@ from services.tts_service import STATIC_MESSAGES, _TEXT_TO_CACHE_KEY
 STAGE_OPENERS: dict[str, str] = {
     SessionStage.GREETING_CONSENT.value:     STATIC_MESSAGES["greeting_initial"],
     SessionStage.OVD_DOCUMENT_CAPTURE.value: STATIC_MESSAGES["ovd_request"],
-    SessionStage.AADHAAR_VERIFICATION.value: STATIC_MESSAGES["otp_request"],
     SessionStage.IDENTITY_KYC.value: (
         "Almost there! Could you please confirm your full name as it appears "
         "on your Aadhaar card, and your date of birth? "
@@ -63,7 +62,6 @@ RE_ASK_TEMPLATES: dict[str, str] = {
     "missing_consent":     "To proceed, I need your verbal consent. Please say 'I agree' or 'I consent'.",
     "ambiguous_purpose":   "Could you be more specific? For example: home renovation, education, or medical expenses?",
     "missing_ovd":         "Please use the upload button on your screen to share a clear photo of your Aadhaar or PAN card.",
-    "missing_aadhaar_otp": "I need the OTP sent to your Aadhaar-linked mobile. Please read out the 6-digit number.",
 }
 
 
@@ -105,8 +103,7 @@ class ConversationAgent:
     async def send_confirmation(self, call_id: str, stage: SessionStage):
         confirmations = {
             SessionStage.GREETING_CONSENT:     "Thank you. Your consent has been recorded. Let's proceed with identity verification.",
-            SessionStage.OVD_DOCUMENT_CAPTURE: "Your document has been received and verified. Let's complete your Aadhaar verification.",
-            SessionStage.AADHAAR_VERIFICATION:  "Aadhaar verified successfully. Could you now confirm your identity details?",
+            SessionStage.OVD_DOCUMENT_CAPTURE: "Your document has been received and verified. Could you now confirm your full name and date of birth?",
             SessionStage.IDENTITY_KYC:          "Identity confirmed. Let me now collect your employment details.",
             SessionStage.EMPLOYMENT_INCOME:     "Income details noted. And what's the purpose of your loan today?",
             SessionStage.LOAN_PURPOSE:          "Got it. Let me now assess your loan eligibility.",
