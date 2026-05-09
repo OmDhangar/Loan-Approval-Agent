@@ -1,5 +1,10 @@
 """
 Redis Client – SharedState persistence layer
+
+FIXES:
+  FIX-BUFFER  Two new methods: append_event_buffer() / get_and_clear_event_buffer()
+              Used by the SSE endpoint to guarantee no events are lost before
+              the frontend's EventSource connection is established.
 """
 import json
 import logging
@@ -23,6 +28,7 @@ class RedisClient:
             decode_responses=True,
         )
         await self._client.ping()
+        logger.info("Redis connected")
 
     async def close(self):
         if self._client:
@@ -58,13 +64,13 @@ class RedisClient:
                         await pipe.reset()
                         return False, -1
 
-                    state_obj = json.loads(raw)
+                    state_obj       = json.loads(raw)
                     current_version = int(state_obj.get("version", 0))
                     if current_version != expected_version:
                         await pipe.reset()
                         return False, current_version
 
-                    merged = self._deep_merge_dict(state_obj, patch)
+                    merged            = self._deep_merge_dict(state_obj, patch)
                     merged["version"] = current_version + 1
 
                     pipe.multi()
@@ -98,10 +104,92 @@ class RedisClient:
             nx=True,
         ))
 
-    # ── Pub/Sub for frontend real-time updates ────────────────────────────────
+    # ── TTS Cache ─────────────────────────────────────────────────────────────
+
+    async def set_tts_cache(
+        self, cache_key: str, audio_path: str, ttl: int | None = None
+    ) -> None:
+        try:
+            if ttl is None:
+                await self._client.set(cache_key, audio_path)
+            else:
+                await self._client.set(cache_key, audio_path, ex=ttl)
+            logger.debug(f"TTS cache set: {cache_key}")
+        except Exception as e:
+            logger.warning(f"set_tts_cache failed [{cache_key}]: {e}")
+
+    async def get_tts_cache(self, cache_key: str) -> Optional[str]:
+        try:
+            value = await self._client.get(cache_key)
+            if value:
+                logger.debug(f"TTS cache hit: {cache_key}")
+            return value
+        except Exception as e:
+            logger.warning(f"get_tts_cache failed [{cache_key}]: {e}")
+            return None
+
+    # ── SSE Event Replay Buffer ────────────────────────────────────────────────
+    # FIX-BUFFER: Events published while no SSE subscriber is listening are
+    # pushed into a short-lived Redis list. When the SSE connection is
+    # established (which always happens 200-800ms after /join returns) the
+    # generator replays the buffer first, then switches to live pub/sub.
+    # This completely eliminates the race condition where the greeting is
+    # published before the frontend EventSource is connected.
+
+    _BUFFER_KEY_PREFIX = "session_evt_buf"
+    _BUFFER_TTL        = 30          # seconds — events older than this are irrelevant
+    _BUFFER_MAX_LEN    = 50          # guard against unbounded growth
+
+    def _buf_key(self, call_id: str) -> str:
+        return f"{self._BUFFER_KEY_PREFIX}:{call_id}"
+
+    async def append_event_buffer(self, call_id: str, message: dict) -> None:
+        """
+        Push an event to the replay buffer AND to the pub/sub channel.
+        Called by publish() — callers do not need to change.
+        """
+        key = self._buf_key(call_id)
+        try:
+            serialised = json.dumps(message)
+            pipe = self._client.pipeline()
+            pipe.rpush(key, serialised)
+            pipe.ltrim(key, -self._BUFFER_MAX_LEN, -1)   # keep last N
+            pipe.expire(key, self._BUFFER_TTL)
+            await pipe.execute()
+        except Exception as e:
+            logger.debug(f"Event buffer append failed (non-fatal): {e}")
+
+    async def get_and_clear_event_buffer(self, call_id: str) -> list[str]:
+        """
+        Atomically return all buffered events and delete the buffer.
+        Called once when the SSE generator starts.
+        Returns a list of raw JSON strings, oldest-first.
+        """
+        key = self._buf_key(call_id)
+        try:
+            pipe = self._client.pipeline()
+            pipe.lrange(key, 0, -1)
+            pipe.delete(key)
+            results = await pipe.execute()
+            return results[0] if results else []
+        except Exception as e:
+            logger.debug(f"Event buffer read failed (non-fatal): {e}")
+            return []
+
+    # ── Pub/Sub ───────────────────────────────────────────────────────────────
 
     async def publish(self, channel: str, message: dict) -> None:
-        await self._client.publish(channel, json.dumps(message))
+        """
+        Publish to Redis pub/sub AND append to the replay buffer when the
+        channel is a session events channel.
+        """
+        serialised = json.dumps(message)
+        await self._client.publish(channel, serialised)
+
+        # Buffer only session-level event channels
+        if channel.startswith("session:") and channel.endswith(":events"):
+            call_id = channel.split(":")[1]
+            await self.append_event_buffer(call_id, message)
 
     async def subscribe(self, channel: str):
         pubsub = self._client.pubsub()
@@ -111,10 +199,19 @@ class RedisClient:
     # ── Session registry ──────────────────────────────────────────────────────
 
     async def register_session(self, call_id: str, meta: dict) -> None:
-        await self._client.hset("active_sessions", call_id, json.dumps(meta))
+        try:
+            await self._client.hset("active_sessions", call_id, json.dumps(meta))
+            await self._client.set(
+                f"session_meta:{call_id}",
+                json.dumps(meta),
+                ex=settings.REDIS_STATE_TTL_SECONDS,
+            )
+        except Exception as e:
+            logger.warning(f"register_session failed [{call_id}]: {e}")
 
     async def unregister_session(self, call_id: str) -> None:
         await self._client.hdel("active_sessions", call_id)
+        await self._client.delete(f"session_meta:{call_id}")
 
     async def list_active_sessions(self) -> list:
         raw = await self._client.hgetall("active_sessions")
@@ -129,14 +226,13 @@ class RedisClient:
         val = await self._client.get(f"quality:{call_id}")
         return int(val) if val else 5
 
-    # ── Key scanning (for vision agent snapshot lookup) ────────────────────────
+    # ── Key scanning ──────────────────────────────────────────────────────────
 
     async def scan_keys(self, pattern: str) -> list[str]:
-        """Scan Redis keys matching a glob pattern."""
         keys = []
         async for key in self._client.scan_iter(match=pattern, count=100):
             keys.append(key)
-            if len(keys) >= 10:  # limit to prevent excessive scanning
+            if len(keys) >= 10:
                 break
         return keys
 

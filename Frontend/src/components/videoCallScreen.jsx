@@ -95,11 +95,13 @@ function CallUI({ callId }) {
   const [networkScore,  setNetworkScore] = useState(5);
   const [audioFirst,    setAudioFirst]   = useState(false);
   const [error,         setError]        = useState(null);
+  const [audioUnlocked, setAudioUnlocked] = useState(false);
   const [agentSpeech,   setAgentSpeech]  = useState("");
   const [debugSpeech,   setDebugSpeech]  = useState("");
   // Local mic/cam state tracking (syncs with VideoSDK but prevents stale closures)
   const [micActive,     setMicActive]    = useState(true);
   const [camActive,     setCamActive]    = useState(true);
+  const [audioEnabled,  setAudioEnabled] = useState(false);
   const toggleCooldown                   = useRef(false);
   const evtSourceRef                     = useRef(null);
   const audioPlayerRef                   = useRef(null);
@@ -118,6 +120,41 @@ function CallUI({ callId }) {
   const { webcamStream, micStream } = useParticipant(localParticipantId);
 
   // ── SSE – real-time backend events ────────────────────────────────────────
+  // ── Robust audio playback function (Task 2) ──────────────────────────────
+  const playAudio = useCallback(async (url) => {
+    try {
+      console.log("[AUDIO] Attempting playback:", url);
+
+      if (!audioPlayerRef.current) {
+        console.error("[AUDIO] audioPlayerRef is null — cannot play");
+        return;
+      }
+
+      const audio = audioPlayerRef.current;
+      audio.src = url;
+      audio.volume = 1.0;
+      audio.muted = false;
+
+      console.log("[AUDIO] readyState before play:", audio.readyState,
+        "| networkState:", audio.networkState,
+        "| paused:", audio.paused);
+
+      const playPromise = audio.play();
+
+      if (playPromise !== undefined) {
+        await playPromise;
+        console.log("[AUDIO] ✅ Playback SUCCESS");
+      }
+    } catch (err) {
+      console.error("[AUDIO] ❌ Playback FAILED:", err.name, err.message);
+      // If autoplay was blocked, show a user-facing message
+      if (err.name === "NotAllowedError") {
+        setError("Audio blocked by browser. Click anywhere on the page, then try again.");
+      }
+    }
+  }, []);
+
+  // ── SSE – real-time backend events ────────────────────────────────────────
   useEffect(() => {
     const src = new EventSource(`/api/v1/session/${callId}/events`);
     evtSourceRef.current = src;
@@ -129,18 +166,16 @@ function CallUI({ callId }) {
           setAgentSpeech(evt.text);
           // Clear agent speech after 10 seconds
           setTimeout(() => setAgentSpeech(""), 10000);
+          // NOTE: Browser TTS fallback REMOVED — it conflicts with server TTS audio.
+          // Server TTS arrives via TTS_AUDIO_READY event and plays through <audio> element.
           break;
         case "TTS_AUDIO_READY":
-          // Play audio when synthesis is complete
-          if (evt.audio_url && audioPlayerRef.current) {
-            console.log("Playing agent audio:", evt.audio_url);
-            audioPlayerRef.current.src = evt.audio_url;
-            audioPlayerRef.current.play().catch(err => {
-              console.error("Agent audio playback failed:", err);
-              setError("Audio playback blocked. Please click anywhere on the page.");
-            });
+          // Task 5: Always attempt playback (no audioEnabled gate)
+          console.log("[AUDIO] TTS_AUDIO_READY event received:", evt);
+          if (evt.audio_url) {
+            playAudio(evt.audio_url);
           } else {
-            console.warn("TTS_AUDIO_READY received but audioPlayerRef or audio_url is missing");
+            console.warn("[AUDIO] TTS_AUDIO_READY missing audio_url", evt);
           }
           break;
         case "STT_UTTERANCE":
@@ -167,11 +202,46 @@ function CallUI({ callId }) {
     };
 
     return () => src.close();
-  }, [callId]);
+  }, [callId, playAudio]);
 
   useEffect(() => {
     joinedRef.current = joined;
   }, [joined]);
+
+  // ── Audio event listeners for debugging (Task 3) ────────────────────────
+  useEffect(() => {
+    const audio = audioPlayerRef.current;
+    if (!audio) return;
+
+    const onPlay      = () => console.log("[AUDIO EVENT] ▶ PLAY");
+    const onPause     = () => console.log("[AUDIO EVENT] ⏸ PAUSE");
+    const onEnded     = () => console.log("[AUDIO EVENT] ⏹ ENDED");
+    const onError     = (e) => console.error("[AUDIO EVENT] ❌ ERROR", e);
+    const onCanPlay   = () => console.log("[AUDIO EVENT] ✅ CAN_PLAY  readyState:", audio.readyState);
+    const onLoadData  = () => console.log("[AUDIO EVENT] 📦 LOADED_DATA  duration:", audio.duration);
+    const onWaiting   = () => console.log("[AUDIO EVENT] ⏳ WAITING");
+    const onStalled   = () => console.log("[AUDIO EVENT] ⚠️ STALLED");
+
+    audio.addEventListener("play",       onPlay);
+    audio.addEventListener("pause",      onPause);
+    audio.addEventListener("ended",      onEnded);
+    audio.addEventListener("error",      onError);
+    audio.addEventListener("canplay",    onCanPlay);
+    audio.addEventListener("loadeddata", onLoadData);
+    audio.addEventListener("waiting",    onWaiting);
+    audio.addEventListener("stalled",    onStalled);
+
+    return () => {
+      audio.removeEventListener("play",       onPlay);
+      audio.removeEventListener("pause",      onPause);
+      audio.removeEventListener("ended",      onEnded);
+      audio.removeEventListener("error",      onError);
+      audio.removeEventListener("canplay",    onCanPlay);
+      audio.removeEventListener("loadeddata", onLoadData);
+      audio.removeEventListener("waiting",    onWaiting);
+      audio.removeEventListener("stalled",    onStalled);
+    };
+  }, []);
 
   const notifySessionEnd = useCallback(async () => {
     if (endSentRef.current) return;
@@ -228,7 +298,43 @@ function CallUI({ callId }) {
     };
   }, [callId]);
 
-  const handleJoin = useCallback(() => {
+  const handleJoin = useCallback(async () => {
+    // Request microphone permission explicitly
+    try {
+      await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+      console.log("Microphone and camera permissions granted");
+    } catch (err) {
+      console.error("Permission denied:", err);
+      setError("Microphone/camera access is required for the video call. Please allow permissions in your browser settings.");
+      return;
+    }
+
+    // ── Task 4: Unlock audio context via user gesture ─────────────────────
+    // Use Web Audio API to play a silent buffer — no file source needed.
+    // This unlocks the browser's audio context within the click call stack.
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      const ctx = new AudioCtx();
+      const buffer = ctx.createBuffer(1, 1, 22050); // 1 channel, 1 sample, 22050Hz
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+      source.start(0);
+
+      // Also resume if suspended (Chrome often starts AudioContext suspended)
+      if (ctx.state === "suspended") {
+        await ctx.resume();
+      }
+
+      setAudioUnlocked(true);
+      setAudioEnabled(true);
+      console.log("[AUDIO] ✅ Audio context unlocked via Web Audio API (state:", ctx.state, ")");
+    } catch (err) {
+      console.warn("[AUDIO] ⚠️ Audio unlock failed (will retry on first TTS):", err.message);
+      // Still proceed — playAudio() will attempt play() anyway
+      setAudioEnabled(true);
+    }
+
     join();
     setJoined(true);
     setStage("GREETING_CONSENT");
@@ -504,10 +610,14 @@ function CallUI({ callId }) {
   // ── Layout ────────────────────────────────────────────────────────────────
   return (
     <div style={styles.root}>
-      <audio 
-        ref={audioPlayerRef} 
-        style={{ position: 'absolute', opacity: 0, pointerEvents: 'none' }} 
+      {/* Task 1: Properly configured hidden audio element */}
+      <audio
+        ref={audioPlayerRef}
+        autoPlay
+        playsInline
+        preload="auto"
         crossOrigin="anonymous"
+        style={{ display: "none" }}
       />
       {/* Background grain texture */}
       <div style={styles.grain} />
@@ -517,6 +627,40 @@ function CallUI({ callId }) {
         <div style={styles.errorNotification}>
           <span>⚠️ {error}</span>
           <button onClick={() => setError(null)} style={styles.errorClose}>✕</button>
+        </div>
+      )}
+
+      {/* Audio unlock fallback overlay — shown only if automatic unlock failed */}
+      {joined && !audioUnlocked && (
+        <div
+          style={styles.audioOverlay}
+          onClick={async () => {
+            try {
+              const AudioCtx = window.AudioContext || window.webkitAudioContext;
+              const ctx = new AudioCtx();
+              const buffer = ctx.createBuffer(1, 1, 22050);
+              const source = ctx.createBufferSource();
+              source.buffer = buffer;
+              source.connect(ctx.destination);
+              source.start(0);
+              if (ctx.state === "suspended") await ctx.resume();
+              setAudioUnlocked(true);
+              setAudioEnabled(true);
+              console.log("[AUDIO] ✅ Audio unlocked via manual click (Web Audio API)");
+            } catch (err) {
+              console.error("[AUDIO] Manual unlock failed:", err);
+            }
+          }}
+        >
+          <div style={styles.audioOverlayContent}>
+            <span style={{ fontSize: 48 }}>🔊</span>
+            <p style={{ color: BRAND.text, marginTop: 16, fontSize: 18, fontWeight: 600 }}>
+              Tap to Enable Agent Voice
+            </p>
+            <p style={{ color: BRAND.textMuted, marginTop: 8, fontSize: 14 }}>
+              Your browser requires a click to allow audio playback
+            </p>
+          </div>
         </div>
       )}
 
@@ -551,8 +695,10 @@ function CallUI({ callId }) {
                 audioFirst={audioFirst}
                 videoRef={localVideoRef}
               />
+              {/* AI Agent Avatar (static) */}
+              <AgentAvatar />
               {participantIds.map((pid) => (
-                <RemoteView key={pid} participantId={pid} />
+                <RemoteView key={pid} participantId={pid} localParticipantId={localParticipant?.id} />
               ))}
             </div>
 
@@ -682,10 +828,16 @@ function LocalView({ participantId, audioFirst, videoRef: externalVideoRef }) {
   );
 }
 
-function RemoteView({ participantId }) {
+function RemoteView({ participantId, localParticipantId }) {
   const { webcamStream, micStream, displayName, webcamOn } = useParticipant(participantId);
   const vidRef = useRef(null);
   const audRef = useRef(null);
+
+  // Skip if this is the local participant (prevent duplicate video)
+  if (participantId === localParticipantId) return null;
+
+  // Skip AI-agent silent participant (prefix: ai-agent-)
+  if (participantId.startsWith("ai-agent-")) return null;
 
   useEffect(() => {
     if (vidRef.current && webcamStream) {
@@ -700,9 +852,6 @@ function RemoteView({ participantId }) {
       audRef.current.play().catch(e => console.warn("Remote audio play error:", e));
     }
   }, [micStream]);
-
-  // Skip AI-agent silent participant (prefix: ai-agent-)
-  if (participantId.startsWith("ai-agent-")) return null;
 
   const isOfficer = participantId.startsWith("official-");
 
@@ -721,6 +870,25 @@ function RemoteView({ participantId }) {
       <audio ref={audRef} autoPlay />
       <div style={styles.videoLabel}>
         {isOfficer ? "👤 Loan Officer" : displayName || "AI Agent"}
+      </div>
+    </div>
+  );
+}
+
+function AgentAvatar() {
+  return (
+    <div style={styles.videoCard}>
+      <div style={{
+        ...styles.videoOff,
+        background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+      }}>
+        <span style={{ fontSize: 64 }}>🤖</span>
+        <p style={{ color: BRAND.text, marginTop: 12, fontSize: 14, fontWeight: 600 }}>
+          Loan Wizard AI
+        </p>
+      </div>
+      <div style={styles.videoLabel}>
+        🤖 AI Agent
       </div>
     </div>
   );
@@ -1293,6 +1461,19 @@ const styles = {
     maxWidth: 300, zIndex: 50, fontFamily: "monospace",
     border: "1px solid rgba(255,255,255,0.1)",
   },
+  audioOverlay: {
+    position: "fixed", top: 0, left: 0, right: 0, bottom: 0,
+    background: "rgba(0,0,0,0.85)", backdropFilter: "blur(8px)",
+    display: "flex", alignItems: "center", justifyContent: "center",
+    zIndex: 1000, cursor: "pointer",
+  },
+  audioOverlayContent: {
+    background: "rgba(255,255,255,0.1)", backdropFilter: "blur(16px)",
+    border: "1px solid rgba(255,255,255,0.2)",
+    borderRadius: 24, padding: "40px 60px",
+    textAlign: "center",
+    animation: "fadeIn 0.3s ease-out",
+  },
 };
 
 
@@ -1371,7 +1552,7 @@ function DocumentUploadOverlay({ callId }) {
         {uploading ? "Analyzing..." : "Confirm & Upload"}
       </button>
       
-      <style jsx>{`
+      <style jsx="true">{`
         .file-input-wrapper label {
           padding: 12px;
           border-radius: 12px;

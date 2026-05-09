@@ -27,7 +27,7 @@ export default function JoinPage() {
         <h2 className="loading-title">Securing Connection</h2>
         <p className="loading-subtitle">Initializing our AI Agent for your session...</p>
         
-        <style jsx>{`
+        <style jsx="true">{`
           .center-screen {
             min-height: 100vh;
             display: flex;
@@ -93,7 +93,7 @@ export default function JoinPage() {
           </button>
         </div>
 
-        <style jsx>{`
+        <style jsx="true">{`
           .center-screen {
             min-height: 100vh;
             display: flex;

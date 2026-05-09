@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from models.shared_state import SharedState
 from core.redis_client import redis_client
 from core.config import settings
-from core.rabbitmq_client import rabbitmq_client
+from core.event_bus import event_bus, Events
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +96,7 @@ class ComplianceAgent:
         geo_distance = state.financial_data.geo_distance_km
         if geo_distance is not None and geo_distance > 50:
             issues.append(f"geo_distance_gt_50km:{geo_distance}")
-            await rabbitmq_client.publish_task("human_oversight", {
+            await event_bus.emit(Events.SESSION_ESCALATED, {
                 "call_id": call_id,
                 "reason": "geo_mismatch_gt_50km",
                 "distance_km": geo_distance,

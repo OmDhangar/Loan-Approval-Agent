@@ -1,254 +1,255 @@
 """
 Conversation Agent
 ──────────────────
-Activated in every stage by the Moderator.
-Manages the actual dialogue with the customer using local LLM (Llama 3.1 8B).
-
-Responsibilities:
-  - Greet the customer and request RBI-compliant consent (Stage 1)
-  - Guide through V-CIP stages (OVD, Liveness, Aadhaar)
-  - Ask structured questions for each stage
-  - Handle re-asks when STT confidence is low
-  - Detect intent and classify responses
-  - Push response text to frontend via Redis pub/sub
-    (frontend renders it as the AI agent's speech / text bubble)
+FIXES APPLIED:
+  FIX-3  Static cache lookup now uses exact-text → cache-key mapping via
+         STATIC_MESSAGES from tts_service instead of the broken
+         "if cached_audio_path in text" check (file path vs spoken text).
+  FIX-4  Step 3 (local FS fallback) now looks up the correct message_id
+         for the current text instead of always checking greeting_initial.
+  FIX-5  Cache-miss path now calls tts_service.save_to_session_cache()
+         which writes the path back into Redis, making subsequent calls hits.
 """
 
+import asyncio
 import logging
+import os
 import time
-import random
+from pathlib import Path as _P
 from typing import Optional
 
 from models.shared_state import SharedState, SessionStage
 from core.redis_client import redis_client
-from core.rabbitmq_client import rabbitmq_client
-from core.config import settings
+from core.event_bus import event_bus, Events
 from core.langgraph_engine import moderator_engine
-from services.tts_service import tts_service
-from services.llm_gateway import llm_gateway
 
 logger = logging.getLogger(__name__)
 
 
-# ── Stage scripts ─────────────────────────────────────────────────────────────
-# Deterministic opening question per stage (LLM used only for follow-ups)
+# ── Stage openers ──────────────────────────────────────────────────────────────
+# These strings must match STATIC_MESSAGES in tts_service.py EXACTLY for the
+# static cache to hit.  Import the canonical map so there is only one source of
+# truth and no risk of typo drift.
 
-STAGE_OPENERS = {
-    SessionStage.GREETING_CONSENT: (
-        "Hello! I'm your Loan Wizard AI assistant from Poonawalla Fincorp. "
-        "This call is being recorded for security and compliance as required by RBI. "
-        "Your personal data will be processed solely for this loan application "
-        "and handled in accordance with our privacy policy. "
-        "To continue, please say 'I agree' or 'I consent'. "
+from services.tts_service import STATIC_MESSAGES, _TEXT_TO_CACHE_KEY
+
+STAGE_OPENERS: dict[str, str] = {
+    SessionStage.GREETING_CONSENT.value:     STATIC_MESSAGES["greeting_initial"],
+    SessionStage.OVD_DOCUMENT_CAPTURE.value: STATIC_MESSAGES["ovd_request"],
+    SessionStage.AADHAAR_VERIFICATION.value: STATIC_MESSAGES["otp_request"],
+    SessionStage.IDENTITY_KYC.value: (
+        "Almost there! Could you please confirm your full name as it appears "
+        "on your Aadhaar card, and your date of birth? "
+        "For example: 'My name is Rahul Sharma, born on 10th May 1994'."
     ),
-    SessionStage.OVD_DOCUMENT_CAPTURE: (
-        "Thank you for your consent. Now I need to verify your identity. "
-        "Please upload your Aadhaar card or PAN card using the upload button on your screen. "
-        "Make sure the image is clear and readable."
-    ),
-    SessionStage.LIVENESS_CHALLENGE: (
-        "Great, I can see the document. Now for a quick liveness check to ensure you are "
-        "physically present. Please look directly at the camera and blink your eyes "
-        "twice slowly. This prevents any spoofing attempts."
-    ),
-    SessionStage.AADHAAR_VERIFICATION: (
-        "Excellent! Now I'll verify your Aadhaar. An OTP has been sent to your "
-        "Aadhaar-linked mobile number. Please read out the 6-digit OTP when you receive it. "
-        "For this demo, you can say any 6-digit number like '1 2 3 4 5 6'."
-    ),
-    SessionStage.IDENTITY_KYC: (
-        "Thank you for completing the verification steps. "
-        "Now, could you please tell me your full name as it appears on your Aadhaar card, "
-        "and your date of birth? For example: 'My name is Rahul Sharma, "
-        "born on 10th May 1994'."
-    ),
-    SessionStage.EMPLOYMENT_INCOME: (
-        "Thank you. Now, are you currently salaried or self-employed? "
+    SessionStage.EMPLOYMENT_INCOME.value: (
+        "Thank you. Are you currently salaried or self-employed? "
         "And what is your approximate monthly income in rupees? "
         "For example: 'I am salaried, earning 50,000 per month'."
     ),
-    SessionStage.LOAN_PURPOSE: (
+    SessionStage.LOAN_PURPOSE.value: (
         "Understood. What is the purpose of the loan you're applying for today? "
-        "For example — home renovation, education, medical, or business? "
+        "For example — home renovation, education, medical expenses, or business? "
         "And how much amount are you looking for?"
     ),
-    SessionStage.RISK_ASSESSMENT: None,   # No dialogue – automated
-    SessionStage.OFFER_ACCEPTANCE: (
-        "I'm now generating a personalised loan offer based on your profile. "
-        "Please hold for just a moment…"
-    ),
+    SessionStage.RISK_ASSESSMENT.value:  STATIC_MESSAGES["risk_assessment"],
+    SessionStage.OFFER_ACCEPTANCE.value: STATIC_MESSAGES["offer_generation"],
 }
 
-RE_ASK_TEMPLATES = {
-    "low_stt_confidence":  "I'm sorry, I didn't catch that clearly. Could you please repeat that?",
+RE_ASK_TEMPLATES: dict[str, str] = {
+    "low_stt_confidence":  "I'm sorry, I didn't quite catch that. Could you please repeat that clearly?",
     "missing_income":      "Could you tell me your monthly income in rupees? For example, '35,000 rupees per month'.",
-    "missing_name":        "I need both your first name and last name as they appear on your Aadhaar. Could you please state your full name and date of birth?",
+    "missing_name":        "I need your full name as on your Aadhaar — both first name and last name — and your date of birth.",
     "missing_consent":     "To proceed, I need your verbal consent. Please say 'I agree' or 'I consent'.",
-    "ambiguous_purpose":   "Could you be more specific about the loan purpose? For example, home renovation, education, or medical expenses?",
-    "missing_ovd":         "I need to verify your identity document. Please use the upload button on your screen to upload a clear image of your Aadhaar or PAN card.",
-    "missing_liveness":    "I need you to complete the liveness check. Please look at the camera and blink your eyes twice slowly.",
-    "missing_aadhaar_otp": "I need the OTP for Aadhaar verification. Please read out the 6-digit OTP sent to your Aadhaar-linked mobile. For this demo, you can say any 6-digit number.",
+    "ambiguous_purpose":   "Could you be more specific? For example: home renovation, education, or medical expenses?",
+    "missing_ovd":         "Please use the upload button on your screen to share a clear photo of your Aadhaar or PAN card.",
+    "missing_aadhaar_otp": "I need the OTP sent to your Aadhaar-linked mobile. Please read out the 6-digit number.",
 }
-
-# ── Liveness challenge prompts (randomised for anti-spoofing) ─────────────────
-LIVENESS_PROMPTS = [
-    "Please blink your eyes twice slowly while looking at the camera.",
-    "Please slowly turn your head to the left and then to the right.",
-    "Please nod your head up and down slowly.",
-]
 
 
 class ConversationAgent:
+    """
+    Drives the customer-facing dialogue.
+    Subscribes to EventBus events — no polling, no queue.
+    """
 
-    async def handle_task(self, payload: dict):
-        call_id = payload["call_id"]
-        action  = payload.get("action", "")
+    def __init__(self):
+        event_bus.subscribe(Events.STAGE_ENTERED,        self._on_stage_entered)
+        event_bus.subscribe(Events.LOW_CONFIDENCE_SPEECH, self._on_re_ask)
 
+    # ── Event handlers ─────────────────────────────────────────────────────────
+
+    async def _on_stage_entered(self, data: dict):
+        call_id = data["call_id"]
+        stage   = data["stage"]
+        opener  = STAGE_OPENERS.get(stage)
+        if opener:
+            await self._send_message(call_id, opener)
+
+    async def _on_re_ask(self, data: dict):
+        call_id  = data["call_id"]
+        reason   = data.get("reason", "low_stt_confidence")
+        template = RE_ASK_TEMPLATES.get(reason, RE_ASK_TEMPLATES["low_stt_confidence"])
+        await self._send_message(call_id, template)
+
+    # ── Direct call API ────────────────────────────────────────────────────────
+
+    async def send_stage_opener(self, call_id: str, stage: str):
+        opener = STAGE_OPENERS.get(stage)
+        if opener:
+            logger.info(f"Sending stage opener for {stage} [{call_id}]: {opener[:50]}...")
+            await self._send_message(call_id, opener)
+        else:
+            logger.warning(f"No stage opener found for stage: {stage}")
+
+    async def send_confirmation(self, call_id: str, stage: SessionStage):
+        confirmations = {
+            SessionStage.GREETING_CONSENT:     "Thank you. Your consent has been recorded. Let's proceed with identity verification.",
+            SessionStage.OVD_DOCUMENT_CAPTURE: "Your document has been received and verified. Let's complete your Aadhaar verification.",
+            SessionStage.AADHAAR_VERIFICATION:  "Aadhaar verified successfully. Could you now confirm your identity details?",
+            SessionStage.IDENTITY_KYC:          "Identity confirmed. Let me now collect your employment details.",
+            SessionStage.EMPLOYMENT_INCOME:     "Income details noted. And what's the purpose of your loan today?",
+            SessionStage.LOAN_PURPOSE:          "Got it. Let me now assess your loan eligibility.",
+        }
+        msg = confirmations.get(stage, "Thank you. Moving to the next step.")
+        await self._send_message(call_id, msg)
+
+    async def send_dynamic_response(self, call_id: str, context: str) -> str:
         raw = await redis_client.get_state(f"session:{call_id}:state")
         if not raw:
-            logger.warning(f"ConversationAgent: No state for {call_id}")
-            return
+            return "Could you please clarify that for me?"
 
         state = SharedState.from_json(raw)
+        from services.llm_gateway import llm_gateway
+        from core.config import settings
 
-        if action == "greet_and_request_consent":
-            await self._send_message(call_id, STAGE_OPENERS[SessionStage.GREETING_CONSENT])
+        prompt = (
+            f"You are a friendly Indian bank loan officer on a video call.\n"
+            f"Stage: {state.current_stage.value}\n"
+            f"Customer name: {state.customer_identity.name or 'Customer'}\n"
+            f"Context: {context}\n"
+            f"Generate ONE short, clear follow-up question (max 2 sentences). "
+            f"Be warm and professional. Simple English only."
+        )
+        text     = await llm_gateway.generate_text(
+            model=settings.LLM_MODEL_SMALL, prompt=prompt,
+            num_predict=50, timeout=20, force_json=False,
+        )
+        response = text or "Could you please clarify that for me?"
+        await self._send_message(call_id, response)
+        return response
 
-        elif action == "request_ovd_document":
-            await self._send_message(call_id, STAGE_OPENERS[SessionStage.OVD_DOCUMENT_CAPTURE])
-
-        elif action == "run_liveness_challenge":
-            # Pick a random liveness prompt for anti-spoofing
-            challenge = random.choice(LIVENESS_PROMPTS)
-            # Store which challenge was given
-            state.customer_identity.liveness_challenge_type = "blink"
-            state.version += 1
-            await redis_client.set_state(state.redis_key(), state.to_json())
-            await self._send_message(call_id, challenge)
-
-        elif action == "request_aadhaar_otp":
-            await self._send_message(call_id, STAGE_OPENERS[SessionStage.AADHAAR_VERIFICATION])
-
-        elif action == "collect_identity_info":
-            await self._send_message(call_id, STAGE_OPENERS[SessionStage.IDENTITY_KYC])
-
-        elif action == "collect_employment_income":
-            await self._send_message(call_id, STAGE_OPENERS[SessionStage.EMPLOYMENT_INCOME])
-
-        elif action == "collect_loan_purpose":
-            await self._send_message(call_id, STAGE_OPENERS[SessionStage.LOAN_PURPOSE])
-
-        elif action == "re_ask_last_question":
-            reason   = payload.get("reason", "low_stt_confidence")
-            template = RE_ASK_TEMPLATES.get(reason, RE_ASK_TEMPLATES["low_stt_confidence"])
-            await self._send_message(call_id, template)
-
-        elif action == "confirm_and_advance":
-            msg = await self._generate_confirmation(state)
-            await self._send_message(call_id, msg)
-            # Notify Moderator that stage is complete
-            await moderator_engine.advance_stage(call_id, {
-                "passed":     True,
-                "agent":      "conversation",
-                "confidence": 0.9,
-            })
-
-        elif action == "generate_dynamic_response":
-            # LLM-generated contextual follow-up
-            msg = await self._generate_followup(state, payload.get("context", ""))
-            await self._send_message(call_id, msg)
+    # ── Core message delivery ──────────────────────────────────────────────────
 
     async def _send_message(self, call_id: str, text: str):
         """
-        Publish AI agent message to frontend via Redis pub/sub.
-        Also synthesizes TTS audio asynchronously.
+        Publish text to frontend immediately via SSE.
+        TTS synthesis runs as fire-and-forget background task.
         """
-        event_data = {
+        await redis_client.publish(f"session:{call_id}:events", {
             "event":   "AI_AGENT_SPEECH",
             "text":    text,
             "call_id": call_id,
             "ts":      time.time(),
-        }
-        
-        # Synthesize audio asynchronously without blocking message publish
+        })
+        logger.info(f"Agent speech published [{call_id}]: {text[:70]}...")
+        asyncio.create_task(self._synthesize_and_deliver(call_id, text))
+
+    async def _synthesize_and_deliver(self, call_id: str, text: str):
+        """
+        4-tier cache with correct lookup logic.
+
+        Tier 1 — Redis session cache   (per-call, text-hash key)
+        Tier 2 — Redis static cache    (FIX-3: exact-text → key via _TEXT_TO_CACHE_KEY)
+        Tier 3 — Local FS static cache (FIX-4: correct message_id per text)
+        Tier 4 — Synthesise fresh      (FIX-5: write-through to Redis on miss)
+        """
+        t_start = time.time()
         try:
+            from services.tts_service import tts_service
+            from pathlib import Path
+
+            text_hash = hash(text) % 1_000_000
+
+            # ── Tier 1: Redis session cache ────────────────────────────────
+            session_key = f"tts:session:{call_id}:{text_hash}"
+            cached_path = await redis_client.get_tts_cache(session_key)
+            if cached_path and Path(cached_path).exists():
+                elapsed = time.time() - t_start
+                logger.info(f"TTS Tier-1 hit (session) [{call_id}] elapsed={elapsed:.3f}s")
+                await self._publish_audio(call_id, cached_path, text, "session_cache")
+                return
+
+            # ── Tier 2: Redis static cache (FIX-3) ────────────────────────
+            # _TEXT_TO_CACHE_KEY maps exact spoken text → "tts:static:<id>"
+            static_redis_key = _TEXT_TO_CACHE_KEY.get(text)
+            if static_redis_key:
+                cached_path = await redis_client.get_tts_cache(static_redis_key)
+                if cached_path and Path(cached_path).exists():
+                    elapsed = time.time() - t_start
+                    logger.info(f"TTS Tier-2 hit (static Redis) [{call_id}] elapsed={elapsed:.3f}s")
+                    await self._publish_audio(call_id, cached_path, text, "static_cache")
+                    return
+
+            # ── Tier 3: Local FS static cache (FIX-4) ─────────────────────
+            # Determine the correct message_id for this text, not always 'greeting_initial'
+            message_id = None
+            for mid, msg_text in STATIC_MESSAGES.items():
+                if msg_text == text:
+                    message_id = mid
+                    break
+
+            if message_id:
+                local_path = await tts_service.retrieve_from_local_storage(
+                    f"static/{message_id}"
+                )
+                if local_path and Path(local_path).exists():
+                    elapsed = time.time() - t_start
+                    logger.info(f"TTS Tier-3 hit (local FS: {message_id}) [{call_id}] elapsed={elapsed:.3f}s")
+                    await self._publish_audio(call_id, local_path, text, "local_cache")
+                    # Repopulate Redis so next call hits Tier 2
+                    if static_redis_key:
+                        await redis_client.set_tts_cache(static_redis_key, local_path, ttl=None)
+                    return
+
+            # ── Tier 4: Synthesise fresh (FIX-5: write-through) ───────────
+            logger.info(f"TTS Tier-4 synthesise [{call_id}] — starting fresh synthesis")
+            t_synth = time.time()
             audio_path = await tts_service.synthesize(text, call_id)
-            if audio_path:
-                # Convert filesystem path to HTTP URL for frontend
-                from pathlib import Path as _P
-                audio_filename = _P(audio_path).name
-                event_data["audio_url"] = f"/api/v1/session/tts/audio/{audio_filename}"
-                logger.info(f"TTS synthesized for call {call_id}: {audio_filename}")
+            synth_elapsed = time.time() - t_synth
+            if audio_path and Path(audio_path).exists():
+                # FIX-5: write-through — next call for the same text will be a Tier-1 hit
+                await tts_service.save_to_session_cache(audio_path, call_id, text_hash)
+                total_elapsed = time.time() - t_start
+                logger.info(
+                    f"TTS Tier-4 complete [{call_id}] synth={synth_elapsed:.2f}s total={total_elapsed:.2f}s"
+                )
+                await self._publish_audio(call_id, audio_path, text, "synthesised")
             else:
-                logger.warning(f"TTS synthesis failed for call {call_id}, sending text-only")
+                logger.warning(f"TTS synthesis returned nothing [{call_id}] — frontend uses browser TTS")
+
         except Exception as e:
-            logger.warning(f"TTS synthesis error for call {call_id}: {e}")
-            # Continue with text-only message if TTS fails
-        
-        await redis_client.publish(f"session:{call_id}:events", event_data)
-        logger.debug(f"Agent message sent [{call_id}]: {text[:60]}...")
+            elapsed = time.time() - t_start
+            logger.warning(f"TTS pipeline error [{call_id}] elapsed={elapsed:.2f}s: {e}")
+            # Frontend falls back to browser TTS automatically
 
-    async def _generate_confirmation(self, state: SharedState) -> str:
-        """Generate a brief stage-completion confirmation message."""
-        name = state.customer_identity.name
+    async def _publish_audio(
+        self, call_id: str, audio_path: str, text: str, source: str
+    ):
+        """Publish TTS_AUDIO_READY with a URL the existing route can serve."""
+        filename  = _P(audio_path).name
+        audio_url = f"/api/v1/session/tts/audio/{filename}"
+        logger.info(f"Publishing TTS audio [{call_id}] source={source} file={filename} url={audio_url}")
+        await redis_client.publish(f"session:{call_id}:events", {
+            "event":     "TTS_AUDIO_READY",
+            "audio_url": audio_url,
+            "text":      text,
+            "call_id":   call_id,
+            "ts":        time.time(),
+            "source":    source,
+        })
+        logger.info(f"TTS audio published successfully [{call_id}]")
 
-        stage_confirmations = {
-            SessionStage.GREETING_CONSENT: (
-                f"Thank you{', ' + name if name else ''}. "
-                "Your consent has been recorded. Let's proceed with identity verification."
-            ),
-            SessionStage.OVD_DOCUMENT_CAPTURE: (
-                "Thank you, I've captured your document. "
-                "Now let's do a quick liveness check."
-            ),
-            SessionStage.LIVENESS_CHALLENGE: (
-                "Liveness check completed successfully. "
-                "Now let's verify your Aadhaar."
-            ),
-            SessionStage.AADHAAR_VERIFICATION: (
-                "Aadhaar verified successfully. "
-                "Now I'll confirm your identity details."
-            ),
-            SessionStage.IDENTITY_KYC: (
-                f"Identity verified{' for ' + name if name else ''}. "
-                "Your name and date of birth have been confirmed against our records. "
-                "Thank you."
-            ),
-            SessionStage.EMPLOYMENT_INCOME: "Income details noted. Thank you.",
-            SessionStage.LOAN_PURPOSE: "Got it. Assessing your loan eligibility now.",
-        }
-        return stage_confirmations.get(
-            state.current_stage,
-            "Thank you. Moving to the next step."
-        )
 
-    async def _generate_followup(self, state: SharedState, context: str) -> str:
-        """
-        Use local LLM to generate a contextual follow-up question.
-        Only triggered when the structured opener doesn't resolve the stage.
-        """
-        prompt = f"""You are a friendly, professional Indian bank loan officer on a video call.
-Stage: {state.current_stage.value}
-Customer name: {state.customer_identity.name or 'Customer'}
-Context: {context}
-Generate ONE short, clear follow-up question (max 2 sentences) to collect missing information.
-Be warm, concise, and professional. Speak in simple English."""
-
-        text = await llm_gateway.generate_text(
-            model=settings.LLM_MODEL_SMALL,
-            prompt=prompt,
-            num_predict=50,
-            timeout=8,
-            force_json=False,
-        )
-        if text:
-            return text
-
-        return "Could you please clarify that for me?"
-
-    async def check_consent_complete(self, state: SharedState) -> bool:
-        """Check if consent stage is complete."""
-        return (
-            state.customer_identity.consent_given
-            and state.customer_identity.consent_timestamp is not None
-        )
+# ── Singleton ─────────────────────────────────────────────────────────────────
+conversation_agent = ConversationAgent()

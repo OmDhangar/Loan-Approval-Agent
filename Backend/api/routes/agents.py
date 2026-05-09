@@ -14,8 +14,8 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from core.redis_client import redis_client
-from core.rabbitmq_client import rabbitmq_client
 from core.langgraph_engine import moderator_engine
+from core.event_bus import event_bus, Events
 from models.shared_state import SharedState, SessionStage
 
 logger = logging.getLogger(__name__)
@@ -118,7 +118,7 @@ async def get_stage(call_id: str):
         "version":      state.version,
         "quality_score": state.session_meta.network_quality_score,
         "consent_given": state.customer_identity.consent_given,
-        "liveness_ok":  state.customer_identity.liveness_passed,
+        "face_match_ok": state.customer_identity.face_match_passed,
         "risk_band":    state.financial_data.risk_band.value,
     }
 
@@ -135,7 +135,8 @@ async def manual_escalate(call_id: str, req: EscalateRequest):
     state.version += 1
     await redis_client.set_state(state.redis_key(), state.to_json())
 
-    await rabbitmq_client.publish_task("human_oversight", {
+    # No RabbitMQ needed; EventBus handles internal notifications
+    await event_bus.emit(Events.SESSION_ESCALATED, {
         "call_id": call_id,
         "reason":  req.reason,
     })

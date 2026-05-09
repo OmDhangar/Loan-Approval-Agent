@@ -1,84 +1,57 @@
 """
-STT Pipeline Agent
-──────────────────
-Receives raw transcription from VideoSDK webhook,
-re-processes with Whisper large-v3 for:
-  - Higher accuracy (fine-tuned on Hinglish)
-  - Per-token confidence scores
-  - Entity extraction (income, dates, names, Aadhaar)
-  - Moderator retry signal if confidence < threshold
+STT Pipeline
+─────────────
+Direct async processor for speech transcripts.
+
+Refactor changes:
+  - Removed RabbitMQ dependency — called directly from session.py transcript endpoint
+  - Removed LIVENESS_CHALLENGE stage handling
+  - Emits EventBus events instead of pushing to moderator via interrupt
+  - process_utterance() is now a direct async call, not a queue consumer
 """
 
-import importlib
 import logging
 import re
 import time
 from typing import Optional
 
-import numpy as np
-
-from models.shared_state import SharedState, ConversationEntry
+from models.shared_state import SharedState, ConversationEntry, SessionStage
 from core.redis_client import redis_client
-from core.config import settings
+from core.event_bus import event_bus, Events
 from core.langgraph_engine import moderator_engine
 
 logger = logging.getLogger(__name__)
 
-# Lazy-loaded to avoid startup delay
-_whisper_model = None
-
-
-def _get_whisper_model():
-    global _whisper_model
-    if _whisper_model is None:
-        whisper = importlib.import_module("whisper")
-
-        logger.info(f"Loading Whisper model: {settings.WHISPER_MODEL}")
-        _whisper_model = whisper.load_model(settings.WHISPER_MODEL)
-    return _whisper_model
-
 
 class STTPipeline:
     """
-    Whisper-based STT pipeline with entity extraction.
-    Activated per utterance from VideoSDK transcription webhook.
+    Direct-call STT pipeline with entity extraction.
+    Called from the /transcript endpoint synchronously — no queue hop.
     """
 
-    async def handle_task(self, payload: dict):
-        call_id    = payload["call_id"]
-        action     = payload.get("action", "process_utterance")
-        raw_text   = payload.get("raw_transcript", "")
-        timestamp  = payload.get("timestamp", time.time())
-
-        if action == "process_utterance":
-            await self._process_utterance(call_id, raw_text, timestamp)
-
-    async def _process_utterance(self, call_id: str, raw_text: str, timestamp: float):
+    async def process_utterance(self, call_id: str, raw_text: str, timestamp: float):
         """
         Main STT processing pipeline:
-        1. Accept VideoSDK transcript as baseline
-        2. Compute confidence from Whisper logprobs if audio available
-        3. Extract entities with local LLM
-        4. Validate entities before writing to state
-        5. Write to Shared State conversation_log
-        6. Signal Moderator if confidence below threshold
+        1. Accept transcript from browser Web Speech API
+        2. Compute confidence heuristic
+        3. Extract entities with local LLM (stage-aware)
+        4. Apply entities to SharedState (with validation)
+        5. Write updated state to Redis
+        6. Emit live caption to frontend via Redis pub/sub
+        7. Signal SessionOrchestrator via EventBus
         """
         raw = await redis_client.get_state(f"session:{call_id}:state")
         if not raw:
-            logger.warning(f"No state found for {call_id}")
+            logger.warning(f"STTPipeline: no state for {call_id}")
             return
 
         state = SharedState.from_json(raw)
-
-        # For MVP: use VideoSDK transcript directly (Whisper audio not yet wired)
-        # In production: pull audio buffer from S3 temp store and run Whisper
         transcript = raw_text.strip()
+        if not transcript:
+            return
+
         confidence = self._estimate_confidence(transcript)
-
-        # Entity extraction via local LLM
-        entities = await self._extract_entities(transcript, state.current_stage.value)
-
-        # Validate and apply entities (with stage-aware validation)
+        entities   = await self._extract_entities(transcript, state.current_stage.value)
         self._apply_entities(state, entities)
 
         # Append to conversation log
@@ -94,22 +67,17 @@ class STTPipeline:
         state.version += 1
         await redis_client.set_state(state.redis_key(), state.to_json())
 
-        # Publish to frontend for live caption display
+        # Live caption to frontend
         await redis_client.publish(f"session:{call_id}:events", {
             "event":      "STT_UTTERANCE",
             "transcript": transcript,
             "confidence": confidence,
             "entities":   entities,
             "call_id":    call_id,
+            "ts":         time.time(),
         })
 
-        await redis_client.publish(f"session:{call_id}:events", {
-            "event": "STT_PROCESSED",
-            "call_id": call_id,
-            "stage": state.current_stage.value,
-            "confidence": confidence,
-            "consent_present": state.customer_identity.consent_given,
-        })
+        # Let the orchestrator decide on stage progression
         await moderator_engine.handle_stt_processed(
             call_id=call_id,
             confidence=confidence,
@@ -117,32 +85,38 @@ class STTPipeline:
             stage=state.current_stage.value,
         )
 
+    # ── Confidence estimation ──────────────────────────────────────────────────
+
     def _estimate_confidence(self, transcript: str) -> float:
         """
-        Heuristic confidence for MVP since browser API confidence is sometimes 0.
+        Heuristic confidence for MVP.
+        Browser Web Speech API confidence is often 0, so we use text quality.
         """
         if not transcript or len(transcript.strip()) < 2:
             return 0.3
-        
-        # If they spoke at least one valid word, we treat it as high confidence
+        words = transcript.strip().split()
+        if len(words) < 2:
+            return 0.6     # Single word — possibly misheard
         return 0.95
+
+    # ── Entity extraction ──────────────────────────────────────────────────────
 
     async def _extract_entities(self, transcript: str, stage: str) -> dict:
         """
-        Use local LLM (Ollama) to extract structured entities from transcript.
-        Prompt is stage-aware to focus extraction.
+        Stage-aware entity extraction via local LLM (Ollama).
+        Falls back to keyword matching for critical fields (consent, OTP, OVD type).
         """
         from services.llm_gateway import llm_gateway
+        from core.config import settings
+
         stage_hints = {
-            "GREETING_CONSENT":      "Look for: consent phrases like 'I agree', 'yes I consent', name",
-            "OVD_DOCUMENT_CAPTURE":  "Look for: document type mentioned (aadhaar, PAN, pan card), any document number",
-            "LIVENESS_CHALLENGE":    "Look for: confirmation of completing the liveness check, 'done', 'okay', 'I did it'",
+            "GREETING_CONSENT":      "Look for: consent phrases like 'I agree', 'yes I consent', 'haan'",
+            "OVD_DOCUMENT_CAPTURE":  "Look for: document type (aadhaar, PAN), any document number",
             "AADHAAR_VERIFICATION":  "Look for: a 6-digit OTP number",
-            "IDENTITY_KYC":          "Look for: full name (first name + last name), date of birth (DD/MM/YYYY or spoken format)",
-            "EMPLOYMENT_INCOME":     "Look for: employment type (salaried/self-employed), employer name, monthly income in rupees",
+            "IDENTITY_KYC":          "Look for: full name (first + last), date of birth (DD/MM/YYYY)",
+            "EMPLOYMENT_INCOME":     "Look for: employment type (salaried/self-employed), monthly income in rupees",
             "LOAN_PURPOSE":          "Look for: loan purpose, amount needed, repayment period in months",
-            "RISK_ASSESSMENT":       "No extraction needed",
-            "OFFER_ACCEPTANCE":      "Look for: acceptance or rejection of offer, selected tenure",
+            "OFFER_ACCEPTANCE":      "Look for: acceptance or rejection, selected tenure",
         }
         hint = stage_hints.get(stage, "Extract any relevant financial or identity information")
 
@@ -152,7 +126,7 @@ Hint: {hint}
 Transcript: "{transcript}"
 
 Respond ONLY with valid JSON. Example:
-{{"name": null, "dob": null, "income": null, "employment_type": null, "consent": null, "loan_purpose": null, "loan_amount": null, "ovd_type": null, "otp": null, "liveness_done": null}}
+{{"name": null, "dob": null, "income": null, "employment_type": null, "consent": null, "loan_purpose": null, "loan_amount": null, "ovd_type": null, "otp": null}}
 
 If a field is not mentioned, use null. Extract ONLY what is clearly stated."""
 
@@ -161,19 +135,20 @@ If a field is not mentioned, use null. Extract ONLY what is clearly stated."""
             prompt=prompt,
             required_keys=["name", "consent"],
             num_predict=80,
-            timeout=8,
+            timeout=6,   # Shorter timeout for real-time feel
         )
 
-        # Keyword-based fallback for Consent (critical for pipeline progress)
+        # ── Keyword fallbacks for critical fields ──────────────────────────
+
+        # Consent
         if stage == "GREETING_CONSENT":
             consent_val = str(entities.get("consent", "") or "").lower()
             if consent_val not in ("yes", "true", "i agree", "agree"):
                 text = transcript.lower()
-                if any(word in text for word in ["agree", "consent", "yes", "i do", "haan", "thik hai"]):
-                    logger.info("LLM didn't detect consent, but keyword fallback found it.")
+                if any(w in text for w in ["agree", "consent", "yes", "i do", "haan", "thik hai", "ok", "okay"]):
                     entities["consent"] = "yes"
 
-        # Keyword fallback for OVD document type
+        # OVD type
         if stage == "OVD_DOCUMENT_CAPTURE":
             if not entities.get("ovd_type"):
                 text = transcript.lower()
@@ -182,40 +157,37 @@ If a field is not mentioned, use null. Extract ONLY what is clearly stated."""
                 elif any(w in text for w in ["pan", "pan card", "income tax"]):
                     entities["ovd_type"] = "pan"
 
-        # Keyword fallback for liveness confirmation
-        if stage == "LIVENESS_CHALLENGE":
-            if not entities.get("liveness_done"):
-                text = transcript.lower()
-                if any(w in text for w in ["done", "okay", "yes", "did it", "blinked", "haan"]):
-                    entities["liveness_done"] = "yes"
-
-        # Keyword fallback for OTP
+        # OTP — 6-digit number
         if stage == "AADHAAR_VERIFICATION":
             if not entities.get("otp"):
-                # Look for 6-digit number in transcript
                 otp_match = re.search(r'\b(\d{6})\b', transcript.replace(" ", ""))
-                if not otp_match:
-                    # Try extracting spoken digits
+                if otp_match:
+                    entities["otp"] = otp_match.group(1)
+                else:
                     digits = re.findall(r'\d', transcript)
                     if len(digits) >= 6:
                         entities["otp"] = "".join(digits[:6])
-                else:
-                    entities["otp"] = otp_match.group(1)
+
+        # Offer acceptance
+        if stage == "OFFER_ACCEPTANCE":
+            if not entities.get("accepted"):
+                text = transcript.lower()
+                if any(w in text for w in ["accept", "yes", "agree", "proceed", "haan", "theek"]):
+                    entities["accepted"] = "yes"
+                elif any(w in text for w in ["reject", "no", "decline", "nahi", "nope"]):
+                    entities["accepted"] = "no"
 
         return entities
 
+    # ── Entity application ─────────────────────────────────────────────────────
+
     def _apply_entities(self, state: SharedState, entities: dict):
-        """
-        Write extracted entities back into the appropriate state fields.
-        Includes validation to prevent invalid data from being stored.
-        """
-        # Name validation: must have at least 2 words, no obvious non-names
+        """Write extracted entities to SharedState with validation."""
+
+        # Name — must be 2+ words, alphabetic, 5+ chars
         if entities.get("name"):
             name = str(entities["name"]).strip()
             words = name.split()
-            # Must have at least 2 words (first + last name)
-            # Must be alphabetic (no numbers)
-            # Must be at least 5 chars total
             if (
                 len(words) >= 2
                 and len(name) >= 5
@@ -223,29 +195,31 @@ If a field is not mentioned, use null. Extract ONLY what is clearly stated."""
             ):
                 state.customer_identity.name = name
             else:
-                logger.warning(f"Rejected invalid name entity: '{name}'")
+                logger.warning(f"Rejected invalid name: '{name}'")
 
         if entities.get("dob"):
-            state.customer_identity.declared_dob = entities["dob"]
+            state.customer_identity.declared_dob = str(entities["dob"])
 
+        # Income — ₹1,000 to ₹1 crore sanity range
         if entities.get("income"):
             try:
                 income = float(str(entities["income"]).replace(",", "").replace("₹", ""))
-                if 1_000 <= income <= 10_000_000:  # Sanity check
+                if 1_000 <= income <= 10_000_000:
                     state.financial_data.monthly_income = income
                 else:
-                    logger.warning(f"Rejected out-of-range income: {income}")
+                    logger.warning(f"Income out of range: {income}")
             except (ValueError, TypeError):
                 pass
 
+        # Employment type
         if entities.get("employment_type"):
             emp = str(entities["employment_type"]).strip().lower()
-            valid_types = {"salaried", "self-employed", "self employed", "business", "freelance", "professional"}
-            if emp in valid_types:
+            valid = {"salaried", "self-employed", "self employed", "business", "freelance", "professional"}
+            if emp in valid:
                 state.financial_data.employment_type = entities["employment_type"]
 
         if entities.get("loan_purpose"):
-            state.extracted_signals.loan_purpose = entities["loan_purpose"]
+            state.extracted_signals.loan_purpose = str(entities["loan_purpose"])
 
         if entities.get("loan_amount"):
             try:
@@ -256,7 +230,7 @@ If a field is not mentioned, use null. Extract ONLY what is clearly stated."""
                 pass
 
         # Consent
-        if entities.get("consent") and str(entities["consent"]).lower() in ("yes", "true", "i agree", "agree"):
+        if str(entities.get("consent", "") or "").lower() in ("yes", "true", "i agree", "agree"):
             state.customer_identity.consent_given = True
             state.customer_identity.consent_timestamp = time.time()
 
@@ -266,15 +240,21 @@ If a field is not mentioned, use null. Extract ONLY what is clearly stated."""
             if ovd in ("aadhaar", "pan", "passport"):
                 state.customer_identity.ovd_type = ovd
 
-        # Liveness challenge completion
-        if entities.get("liveness_done"):
-            if str(entities["liveness_done"]).lower() in ("yes", "true", "done"):
-                state.customer_identity.liveness_challenge_passed = True
-
-        # Aadhaar OTP
+        # Aadhaar OTP — MVP: any valid 6-digit OTP accepted
         if entities.get("otp"):
             otp = str(entities["otp"]).strip()
             if re.match(r'^\d{6}$', otp):
-                # For MVP: any valid 6-digit OTP is accepted
                 state.customer_identity.aadhaar_otp_verified = True
                 logger.info(f"Aadhaar OTP accepted (mock): {otp[:2]}****")
+
+        # Offer acceptance
+        if str(entities.get("accepted", "") or "").lower() == "yes":
+            if state.final_offer.eligible_amount:
+                state.final_offer.acceptance_status = "ACCEPTED"
+        elif str(entities.get("accepted", "") or "").lower() == "no":
+            if state.final_offer.eligible_amount:
+                state.final_offer.acceptance_status = "DECLINED"
+
+
+# ── Singleton ─────────────────────────────────────────────────────────────────
+stt_pipeline = STTPipeline()
