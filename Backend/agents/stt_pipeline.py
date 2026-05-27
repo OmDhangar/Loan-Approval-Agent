@@ -50,9 +50,19 @@ class STTPipeline:
         if not transcript:
             return
 
+        logger.info(f"\n\n{'='*60}\n🎙️ STT PIPELINE: PROCESSING UTTERANCE\n{'='*60}")
+        logger.info(f"📍 Current Stage: {state.current_stage.value}")
+        logger.info(f"🗣️ Raw Input Transcript: '{transcript}'\n")
+
         confidence = self._estimate_confidence(transcript)
+        
+        logger.info(f"🔍 Extracting entities for stage '{state.current_stage.value}'...")
         entities   = await self._extract_entities(transcript, state.current_stage.value)
+        
+        logger.info(f"🧠 LLM/Keyword Extraction Result:\n   {entities}\n")
+        
         self._apply_entities(state, entities)
+        logger.info(f"✅ Applied entities to SharedState.\n{'='*60}\n")
 
         # Append to conversation log
         entry = ConversationEntry(
@@ -128,6 +138,8 @@ Respond ONLY with valid JSON. Example:
 {{"name": null, "dob": null, "income": null, "employment_type": null, "consent": null, "loan_purpose": null, "loan_amount": null, "ovd_type": null}}
 
 If a field is not mentioned, use null. Extract ONLY what is clearly stated."""
+
+        logger.info(f"🤖 Sending prompt to LLM (Model: {settings.LLM_MODEL_SMALL}):\n{prompt}\n")
 
         entities = await llm_gateway.generate_structured(
             model=settings.LLM_MODEL_SMALL,
