@@ -99,7 +99,6 @@ async def _precompute_session_tts(call_id: str):
         from services.tts_service import tts_service
         session_messages = {
             "greeting_acknowledgment": "Thank you for your agreement. Let's proceed.",
-            "otp_verify":              "Verifying your OTP. One moment...",
             "offer_ready":             "Your offer is ready. Let me show you the details.",
         }
         for msg_id, text in session_messages.items():

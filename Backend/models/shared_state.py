@@ -5,8 +5,8 @@ All agents read from and write to this via Redis.
 Refactor notes:
   - Removed LIVENESS_CHALLENGE stage (merged into OVD_DOCUMENT_CAPTURE)
   - Added doc_authenticity_passed + doc_authenticity_score to CustomerIdentity
-  - Stage order: GREETING_CONSENT → OVD_DOCUMENT_CAPTURE → AADHAAR_VERIFICATION
-                 → IDENTITY_KYC → EMPLOYMENT_INCOME → LOAN_PURPOSE
+  - Stage order: GREETING_CONSENT → OVD_DOCUMENT_CAPTURE → IDENTITY_KYC
+                 → EMPLOYMENT_INCOME → LOAN_PURPOSE
                  → RISK_ASSESSMENT → OFFER_ACCEPTANCE → COMPLETED
 """
 from __future__ import annotations
@@ -22,7 +22,6 @@ class SessionStage(str, Enum):
     INIT                  = "INIT"
     GREETING_CONSENT      = "GREETING_CONSENT"
     OVD_DOCUMENT_CAPTURE  = "OVD_DOCUMENT_CAPTURE"   # V-CIP: doc upload + authenticity
-    AADHAAR_VERIFICATION  = "AADHAAR_VERIFICATION"    # V-CIP: OTP-based e-KYC
     IDENTITY_KYC          = "IDENTITY_KYC"            # Cross-verify name/DOB vs bureau
     EMPLOYMENT_INCOME     = "EMPLOYMENT_INCOME"
     LOAN_PURPOSE          = "LOAN_PURPOSE"
@@ -37,7 +36,6 @@ class SessionStage(str, Enum):
 STAGE_SEQUENCE = [
     SessionStage.GREETING_CONSENT,
     SessionStage.OVD_DOCUMENT_CAPTURE,
-    SessionStage.AADHAAR_VERIFICATION,
     SessionStage.IDENTITY_KYC,
     SessionStage.EMPLOYMENT_INCOME,
     SessionStage.LOAN_PURPOSE,
@@ -104,8 +102,6 @@ class CustomerIdentity:
     doc_authenticity_score: float = 0.0
     doc_authenticity_checks: List[str] = field(default_factory=list)
 
-    # Aadhaar OTP
-    aadhaar_otp_verified: bool = False
 
     # Liveness (kept for API compat – set True when doc auth passes)
     liveness_score: Optional[float] = None

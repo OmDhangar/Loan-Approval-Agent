@@ -104,7 +104,7 @@ class STTPipeline:
     async def _extract_entities(self, transcript: str, stage: str) -> dict:
         """
         Stage-aware entity extraction via local LLM (Ollama).
-        Falls back to keyword matching for critical fields (consent, OTP, OVD type).
+        Falls back to keyword matching for critical fields (consent and OVD type).
         """
         from services.llm_gateway import llm_gateway
         from core.config import settings
@@ -112,7 +112,6 @@ class STTPipeline:
         stage_hints = {
             "GREETING_CONSENT":      "Look for: consent phrases like 'I agree', 'yes I consent', 'haan'",
             "OVD_DOCUMENT_CAPTURE":  "Look for: document type (aadhaar, PAN), any document number",
-            "AADHAAR_VERIFICATION":  "Look for: a 6-digit OTP number",
             "IDENTITY_KYC":          "Look for: full name (first + last), date of birth (DD/MM/YYYY)",
             "EMPLOYMENT_INCOME":     "Look for: employment type (salaried/self-employed), monthly income in rupees",
             "LOAN_PURPOSE":          "Look for: loan purpose, amount needed, repayment period in months",
@@ -126,7 +125,7 @@ Hint: {hint}
 Transcript: "{transcript}"
 
 Respond ONLY with valid JSON. Example:
-{{"name": null, "dob": null, "income": null, "employment_type": null, "consent": null, "loan_purpose": null, "loan_amount": null, "ovd_type": null, "otp": null}}
+{{"name": null, "dob": null, "income": null, "employment_type": null, "consent": null, "loan_purpose": null, "loan_amount": null, "ovd_type": null, "accepted": null}}
 
 If a field is not mentioned, use null. Extract ONLY what is clearly stated."""
 
@@ -156,17 +155,6 @@ If a field is not mentioned, use null. Extract ONLY what is clearly stated."""
                     entities["ovd_type"] = "aadhaar"
                 elif any(w in text for w in ["pan", "pan card", "income tax"]):
                     entities["ovd_type"] = "pan"
-
-        # OTP — 6-digit number
-        if stage == "AADHAAR_VERIFICATION":
-            if not entities.get("otp"):
-                otp_match = re.search(r'\b(\d{6})\b', transcript.replace(" ", ""))
-                if otp_match:
-                    entities["otp"] = otp_match.group(1)
-                else:
-                    digits = re.findall(r'\d', transcript)
-                    if len(digits) >= 6:
-                        entities["otp"] = "".join(digits[:6])
 
         # Offer acceptance
         if stage == "OFFER_ACCEPTANCE":
@@ -239,13 +227,6 @@ If a field is not mentioned, use null. Extract ONLY what is clearly stated."""
             ovd = str(entities["ovd_type"]).lower()
             if ovd in ("aadhaar", "pan", "passport"):
                 state.customer_identity.ovd_type = ovd
-
-        # Aadhaar OTP — MVP: any valid 6-digit OTP accepted
-        if entities.get("otp"):
-            otp = str(entities["otp"]).strip()
-            if re.match(r'^\d{6}$', otp):
-                state.customer_identity.aadhaar_otp_verified = True
-                logger.info(f"Aadhaar OTP accepted (mock): {otp[:2]}****")
 
         # Offer acceptance
         if str(entities.get("accepted", "") or "").lower() == "yes":

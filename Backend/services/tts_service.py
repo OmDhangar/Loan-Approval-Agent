@@ -70,10 +70,6 @@ STATIC_MESSAGES: dict[str, str] = {
         "your Aadhaar card or PAN card. Make sure all four corners are visible and "
         "the text is sharp and readable."
     ),
-    "otp_request": (
-        "An OTP has been sent to your Aadhaar-linked mobile number. "
-        "Please read out the 6-digit OTP when you receive it."
-    ),
     "risk_assessment": (
         "Perfect, thank you! I'm now running your credit assessment. "
         "This usually takes just a few seconds. Please bear with me."

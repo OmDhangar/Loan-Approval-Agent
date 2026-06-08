@@ -28,9 +28,6 @@ def _consent_gate(state: SharedState) -> bool:
 def _ovd_gate(state: SharedState) -> bool:
     return bool(state.customer_identity.ovd_type)
 
-def _aadhaar_gate(state: SharedState) -> bool:
-    return state.customer_identity.aadhaar_otp_verified
-
 def _identity_gate(state: SharedState) -> bool:
     return bool(state.customer_identity.name)
 
@@ -50,7 +47,6 @@ def _offer_gate(state: SharedState) -> bool:
 STAGE_GATES = {
     SessionStage.GREETING_CONSENT:     _consent_gate,
     SessionStage.OVD_DOCUMENT_CAPTURE: _ovd_gate,
-    SessionStage.AADHAAR_VERIFICATION: _aadhaar_gate,
     SessionStage.IDENTITY_KYC:         _identity_gate,
     SessionStage.EMPLOYMENT_INCOME:    _income_gate,
     SessionStage.LOAN_PURPOSE:         _purpose_gate,
@@ -193,7 +189,6 @@ class ModeratorEngine:
         reason_map = {
             SessionStage.GREETING_CONSENT:     "missing_consent",
             SessionStage.OVD_DOCUMENT_CAPTURE: "missing_ovd",
-            SessionStage.AADHAAR_VERIFICATION: "missing_aadhaar_otp",
             SessionStage.IDENTITY_KYC:         "missing_name",
             SessionStage.EMPLOYMENT_INCOME:    "missing_income",
             SessionStage.LOAN_PURPOSE:         "ambiguous_purpose",
