@@ -87,6 +87,10 @@ class ModeratorEngine:
             return
         state = SharedState.from_json(raw)
 
+        logger.info(f"\n\n{'*'*60}\n🚀 STAGE ADVANCEMENT EVALUATION\n{'*'*60}")
+        logger.info(f"📍 Current Stage: {state.current_stage.value}")
+        logger.info(f"📥 Input Result: {result}")
+
         agent      = result.get("agent", "unknown")
         passed     = result.get("passed", False)
         escalate   = result.get("escalate", False)
@@ -121,7 +125,7 @@ class ModeratorEngine:
 
         gate = STAGE_GATES.get(state.current_stage)
         if gate and not gate(state):
-            logger.debug(f"Gate not satisfied for {state.current_stage} [{call_id}]")
+            logger.info(f"❌ Gate failed for {state.current_stage.value} [{call_id}]. Re-asking...\n{'*'*60}\n")
             state.stage_retry_count += 1
             state.version += 1
             await redis_client.set_state(state.redis_key(), state.to_json())
@@ -130,12 +134,16 @@ class ModeratorEngine:
 
         next_stage = state.next_stage()
         if next_stage is None:
+            logger.info(f"🏁 Session Completed [{call_id}]\n{'*'*60}\n")
             await self._complete(call_id, state)
             return
 
         state.stage_retry_count = 0
         state.version += 1
         await redis_client.set_state(state.redis_key(), state.to_json())
+        
+        logger.info(f"✅ Gate passed! Transitioning to next stage: {next_stage.value}\n{'*'*60}\n")
+        
         await self._enter_stage(call_id, next_stage)
 
     async def handle_stt_processed(self, call_id: str, confidence: float, consent_present: bool, stage: str):

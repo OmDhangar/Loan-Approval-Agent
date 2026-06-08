@@ -27,9 +27,6 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379/0"
     REDIS_STATE_TTL_SECONDS: int = 7200   # 2 hours per session
 
-    # ── RabbitMQ ──────────────────────────────────────────────────────────────
-    RABBITMQ_URL: str = "amqp://guest:guest@localhost:5672/"
-
     # ── PostgreSQL ────────────────────────────────────────────────────────────
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/loanwizard"
 

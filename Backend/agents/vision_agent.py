@@ -66,12 +66,12 @@ class VisionAgent:
 
     async def _run_face_match_age(self, call_id: str, state: SharedState):
         """
-        1. Get frame from Redis snapshot
+        1. Get frame from Redis snapshot for THIS session only
         2. Perform face match (person detection + confidence)
         3. Estimate age
         4. Report to Moderator
         """
-        frame = await self._get_frame()
+        frame = await self._get_frame(call_id)  # Pass call_id — fixes cross-session bug
 
         if frame is None:
             logger.warning(f"No frame available for {call_id}")
@@ -102,20 +102,24 @@ class VisionAgent:
             "call_id":       call_id,
         })
 
-    async def _get_frame(self):
+    async def _get_frame(self, call_id: str):
+        """
+        Retrieve the snapshot for a SPECIFIC session.
+        Previously used scan_keys("session:*:snapshot") which would return ANY
+        session's snapshot — catastrophic in multi-session deployments.
+        Now does a direct key lookup: session:{call_id}:snapshot.
+        """
         try:
             import json
-            snapshot_keys = await redis_client.scan_keys("session:*:snapshot")
-            if not snapshot_keys: return None
-
-            raw = await redis_client.get_state(snapshot_keys[0]) # Get latest
-            if raw:
-                data = json.loads(raw)
-                image_b64 = data.get("image")
-                if image_b64:
-                    return _decode_snapshot_image(image_b64)
+            raw = await redis_client.get_state(f"session:{call_id}:snapshot")
+            if not raw:
+                return None
+            data = json.loads(raw)
+            image_b64 = data.get("image")
+            if image_b64:
+                return _decode_snapshot_image(image_b64)
         except Exception as e:
-            logger.warning(f"Failed to get frame: {e}")
+            logger.warning(f"Failed to get frame for [{call_id}]: {e}")
         return None
 
     def _detect_face(self, frame: np.ndarray) -> dict:
