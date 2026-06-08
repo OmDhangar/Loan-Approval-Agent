@@ -114,7 +114,7 @@ class STTPipeline:
     async def _extract_entities(self, transcript: str, stage: str) -> dict:
         """
         Stage-aware entity extraction via local LLM (Ollama).
-        Falls back to keyword matching for critical fields (consent, OTP, OVD type).
+        Falls back to keyword matching for critical fields (consent and OVD type).
         """
         from services.llm_gateway import llm_gateway
         from core.config import settings
@@ -135,7 +135,8 @@ Hint: {hint}
 Transcript: "{transcript}"
 
 Respond ONLY with valid JSON. Example:
-{{"name": null, "dob": null, "income": null, "employment_type": null, "consent": null, "loan_purpose": null, "loan_amount": null, "ovd_type": null}}
+
+{{"name": null, "dob": null, "income": null, "employment_type": null, "consent": null, "loan_purpose": null, "loan_amount": null, "ovd_type": null, "accepted": null}}
 
 If a field is not mentioned, use null. Extract ONLY what is clearly stated."""
 
@@ -172,8 +173,6 @@ If a field is not mentioned, use null. Extract ONLY what is clearly stated."""
                     entities["ovd_type"] = "aadhaar"
                 elif any(w in text for w in ["pan", "pan card", "income tax"]):
                     entities["ovd_type"] = "pan"
-
-
 
         # Offer acceptance
         if stage == "OFFER_ACCEPTANCE":

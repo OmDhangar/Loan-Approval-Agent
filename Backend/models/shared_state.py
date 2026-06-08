@@ -6,8 +6,8 @@ Refactor notes:
   - Removed LIVENESS_CHALLENGE and AADHAAR_VERIFICATION stages
   - Added doc_authenticity_passed + doc_authenticity_score to CustomerIdentity
   - Stage order: GREETING_CONSENT → OVD_DOCUMENT_CAPTURE → IDENTITY_KYC
-                 → EMPLOYMENT_INCOME → LOAN_PURPOSE → RISK_ASSESSMENT
-                 → OFFER_ACCEPTANCE → COMPLETED
+                 → EMPLOYMENT_INCOME → LOAN_PURPOSE
+                 → RISK_ASSESSMENT → OFFER_ACCEPTANCE → COMPLETED
 """
 from __future__ import annotations
 

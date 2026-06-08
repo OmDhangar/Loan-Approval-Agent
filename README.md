@@ -26,6 +26,7 @@
 13. [Network Resilience](#13-network-resilience)
 14. [Production Deployment](#14-production-deployment)
 15. [Development Guide](#15-development-guide)
+16. [48-Hour Project Learning Guide](docs/48_HOUR_PROJECT_LEARNING_GUIDE.md)
 
 ---
 

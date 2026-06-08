@@ -3,7 +3,7 @@
 ## 1) Root Cause Analysis
 - **Sequential turn loop**: speech is captured client-side, posted as full text, then backend does stage logic then TTS; this introduces hard turn boundaries and dead air.
 - **Mixed transport model**: app uses VideoSDK + SSE + HTTP uploads simultaneously, creating duplicated state/event channels.
-- **Overgrown stage machine**: stage orchestration still references removed/legacy Aadhaar OTP semantics in multiple files.
+- **Overgrown stage machine**: stage orchestration had legacy verification semantics spread across multiple files; the OTP path has now been removed from the critical onboarding flow.
 - **Heavy frontend component**: `videoCallScreen.jsx` is a monolith with microphone, speech recognition, event source, recording, upload, rendering, and document UX in one module.
 - **Cold path variance**: model warmup is inconsistent (LLM disabled on startup, TTS warmup in multiple places).
 
@@ -18,7 +18,7 @@
 ## 3) Architecture Flaws
 - Duplicate warmup logic across `main.py` and `session.py` preload helpers.
 - State machine progression and conversational prompts tightly coupled to enum literals.
-- Multiple legacy references (OTP/liveness naming) remain despite flow changes.
+- Some compatibility naming still exists around liveness/document authenticity; keep only what is needed for risk-agent compatibility and remove the rest during the next cleanup pass.
 - Event fan-out split between Redis pubsub + in-process EventBus without explicit ownership boundaries.
 
 ## 4) Dead/Bloat Candidates
